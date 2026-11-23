@@ -54,16 +54,23 @@ h1{font-size:18px;font-weight:700;letter-spacing:.5px}
 #prog .bar{height:10px;background:#ffffff22;border-radius:5px;overflow:hidden;margin:16px 0 12px}
 #progBar{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
 #prog .sub{color:#fbbf24;font-size:13px;font-weight:600}
-#menu{position:fixed;inset:0;background:#000b;display:flex;align-items:center;justify-content:center;z-index:20}
+#menu{position:fixed;inset:0;background:#000b;display:flex;align-items:center;justify-content:center;z-index:40}
 #menu[hidden]{display:none}
 #menu .box{background:#1c1c21;border-radius:18px;padding:22px;width:min(340px,90vw);display:flex;flex-direction:column;gap:10px}
 #menu h3{font-size:18px}
 #menu .small{color:var(--muted);font-size:13px;line-height:1.45}
 #menu .wide{width:100%;height:46px;font-size:15px}
 #menu .main{background:var(--accent)}
-#update{position:fixed;left:50%;top:calc(env(safe-area-inset-top) + 66px);transform:translateX(-50%);z-index:15;background:var(--accent);height:42px;padding:0 18px;font-weight:600;box-shadow:0 4px 18px #0008}
+#update{position:fixed;left:50%;top:calc(env(safe-area-inset-top) + 66px);transform:translateX(-50%);z-index:45;background:var(--accent);height:42px;padding:0 18px;font-weight:600;box-shadow:0 4px 18px #0008}
 #update[hidden]{display:none}
-#toast{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#000c;padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;z-index:9;pointer-events:none}
+#home{position:fixed;inset:0;background:radial-gradient(120% 80% at 50% 0%,#24242b,var(--bg));z-index:30;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:30px;padding-top:calc(env(safe-area-inset-top) + 30px)}
+#home[hidden]{display:none}
+#home .logo{font-size:48px}
+#home h2{font-size:30px;font-weight:800;letter-spacing:.5px}
+#home .count{color:var(--muted);font-size:14px;margin-bottom:14px}
+#home .btn{width:min(300px,80vw);height:56px;font-size:17px;font-weight:600;border-radius:16px}
+#home .go{background:var(--accent)}
+#toast{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#000c;padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;z-index:50;pointer-events:none}
 #toast.show{opacity:1}
 .burst{position:fixed;font-size:90px;color:var(--accent);pointer-events:none;z-index:8;transform:translate(-50%,-50%) scale(.3);opacity:0;animation:pop .7s ease-out forwards}
 @keyframes pop{30%{transform:translate(-50%,-50%) scale(1.15);opacity:1}100%{transform:translate(-50%,-70%) scale(1);opacity:0}}
@@ -79,7 +86,7 @@ input[type=file]{display:none}
 </div>
 
 <header>
-  <h1>Shuffle</h1>
+  <button class="btn" id="homeBtn" title="Menu">🏠</button>
   <div class="row">
     <button class="btn" id="fyBtn" title="For You">✨</button>
     <button class="btn" id="favOnly" title="Show favorites only">★</button>
@@ -124,6 +131,15 @@ input[type=file]{display:none}
     <button class="btn wide" id="reloadBtn">🔄 Reload app</button>
     <button class="btn wide" id="menuClose">Close</button>
   </div>
+</div>
+<div id="home">
+  <div class="logo">🖼️</div>
+  <h2>Shuffle</h2>
+  <div class="count" id="homeCount"></div>
+  <button class="btn go" id="hAll">▶︎ Pictures</button>
+  <button class="btn" id="hFy">✨ For You</button>
+  <button class="btn" id="hFav">★ Favorites</button>
+  <button class="btn" id="hBackup">⋯ Backup</button>
 </div>
 <button class="btn" id="update" hidden>✨ New version — tap to update</button>
 <div id="undo" hidden><span>Deleted</span><button class="btn" id="undoBtn">Undo</button></div>
@@ -186,6 +202,7 @@ const saveFps = () => save('fps', fpMap);
 const saveFavs = () => save('favs', [...favs]);
 const saveState = () => { save('state', { order, curId, favOnly, fy }); save('cur', curId); };
 const saveCur = () => save('cur', curId);
+let atHome = true;                 // privacy menu shows first
 let fy = false, feed = [];          // For You mode + its running feed
 const view = () => fy ? feed : favOnly ? order.filter(id => favs.has(id)) : order;
 const current = () => items.get(curId);
@@ -210,7 +227,7 @@ let statsTimer;
 const saveStatsSoon = () => { clearTimeout(statsTimer); statsTimer = setTimeout(() => save('stats', stats), 2000); };
 let watchId = null, watchStart = 0;
 function startWatch() {
-  if (document.hidden || !curId) return;
+  if (document.hidden || !curId || atHome) return;
   watchId = curId; watchStart = performance.now();
 }
 function stopWatch() {
@@ -481,7 +498,7 @@ function render() {
   want.forEach(c => { if (!c.isConnected) stage.appendChild(c); });
   want.forEach(c => { if (c !== card) c.querySelector('video')?.pause(); });
   const vid = card.querySelector('video');
-  if (vid) { vid.muted = muted; vid.play().catch(() => {}); }
+  if (vid && !atHome) { vid.muted = muted; vid.play().catch(() => {}); }
   if (watchId !== curId) { stopWatch(); startWatch(); }
   updateUI(); saveCur(); prune(); thumbsSoon();
 }
@@ -921,7 +938,7 @@ $('#bkFile').addEventListener('change', async e => {
 });
 
 /* ---------- updates: the page checks GitHub for a newer version of itself ---------- */
-const APP_VERSION = '5';
+const APP_VERSION = '6';
 async function checkUpdate() {
   try {
     const res = await fetch(location.pathname + '?check=' + Date.now(), { cache: 'no-store' });
@@ -937,6 +954,36 @@ $('#update').onclick = reloadFresh;
 $('#reloadBtn').onclick = reloadFresh;
 document.addEventListener('visibilitychange', () => { if (!document.hidden) checkUpdate(); });
 setTimeout(checkUpdate, 3000);
+
+/* ---------- privacy menu ---------- */
+function goHome() {
+  finishAnim();
+  atHome = true;
+  stopWatch();
+  curVideo()?.pause();
+  $('#menu').hidden = true;
+  const n = items.size;
+  $('#homeCount').textContent = n ? `${n} photo${n === 1 ? '' : 's'} & videos · ${favs.size} favorite${favs.size === 1 ? '' : 's'}` : 'Nothing added yet';
+  $('#home').hidden = false;
+}
+function enter(mode) {
+  finishAnim();
+  if (mode === 'fy' && !fy) { fy = true; favOnly = false; feed = curId ? [curId] : []; }
+  if (mode === 'fav') { fy = false; favOnly = true; }
+  if (mode === 'all') { fy = false; favOnly = false; }
+  saveState();
+  atHome = false;
+  $('#home').hidden = true;
+  show();
+}
+$('#hAll').onclick = () => enter('all');
+$('#hFy').onclick = () => enter('fy');
+$('#hFav').onclick = () => enter('fav');
+$('#hBackup').onclick = () => $('#menuBtn').click();
+$('#homeBtn').onclick = goHome;
+// leaving the app (or switching apps) hides everything, so the app-switcher preview is private too
+document.addEventListener('visibilitychange', () => { if (document.hidden) goHome(); });
+addEventListener('pagehide', goHome);
 
 /* ---------- startup ---------- */
 (async function init() {
@@ -995,6 +1042,7 @@ setTimeout(checkUpdate, 3000);
   for (const id of [...favs]) if (!items.has(id)) favs.delete(id);
   saveFavs();
   show();
+  goHome();
 })();
 </script>
 </body>
