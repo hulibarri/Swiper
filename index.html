@@ -70,6 +70,12 @@ h1{font-size:18px;font-weight:700;letter-spacing:.5px}
 #home .count{color:var(--muted);font-size:14px;margin-bottom:14px}
 #home .btn{width:min(300px,80vw);height:56px;font-size:17px;font-weight:600;border-radius:16px}
 #home .go{background:var(--accent)}
+.vstate{position:absolute;inset:0;display:none;align-items:center;justify-content:center;pointer-events:none}
+.vstate[data-s=paused],.vstate[data-s=load]{display:flex}
+.vstate[data-s=paused]::after{content:'▶';display:flex;align-items:center;justify-content:center;width:76px;height:76px;padding-left:6px;border-radius:50%;background:#000a;color:#fff;font-size:32px}
+.vstate[data-s=load]::after{content:'';width:42px;height:42px;border-radius:50%;border:4px solid #ffffff40;border-top-color:#fff;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.err small{color:#6b6b73;font-size:12px}
 #toast{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#000c;padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;z-index:50;pointer-events:none}
 #toast.show{opacity:1}
 .burst{position:fixed;font-size:90px;color:var(--accent);pointer-events:none;z-index:8;transform:translate(-50%,-50%) scale(.3);opacity:0;animation:pop .7s ease-out forwards}
@@ -342,9 +348,20 @@ function getCard(id) {
     const v = document.createElement('video');
     v.loop = true; v.muted = muted; v.playsInline = true; v.preload = 'auto';
     v.setAttribute('playsinline', '');
-    v.addEventListener('error', fail, { once: true });
+    const ov = document.createElement('div');      // spinner while loading, ▶ when paused
+    ov.className = 'vstate';
+    c._vset = st => { ov.dataset.s = st; };
+    c._vset('load');
+    v.addEventListener('waiting', () => c._vset('load'));
+    v.addEventListener('playing', () => c._vset(''));
+    v.addEventListener('pause', () => c._vset(v.readyState >= 2 ? 'paused' : 'load'));
+    v.addEventListener('loadeddata', () => {
+      if (v.paused) c._vset('paused');
+      if (c === card && !atHome) v.play().catch(() => c._vset('paused'));
+    });
+    v.addEventListener('error', () => videoTrouble(id, c, v));
     v.src = item.src;
-    c.appendChild(v);
+    c.append(v, ov);
   } else {
     // tiny 24px copy stretched behind the photo = soft blurred background, almost free to draw
     const bg = document.createElement('canvas');
@@ -468,6 +485,42 @@ async function thumbLoop() {
   thumbsSoon(500);   // paused because you were swiping; pick up again shortly
 }
 
+/* ---------- videos that won't play: retry once, then explain why ---------- */
+let videoWatch;
+async function videoTrouble(id, c, v) {
+  const it = items.get(id);
+  if (!it || c._explained) return;
+  if (!c._retried && it.local) {                   // 1st time: reload the file fresh from storage
+    c._retried = true;
+    try {
+      const rec = await idb('readonly', s => s.get(id));
+      if (rec?.blob) {
+        URL.revokeObjectURL(it.src);
+        it.blob = rec.blob; it.src = URL.createObjectURL(rec.blob);
+        v.src = it.src; v.load();
+        if (c === card && !atHome) v.play().catch(() => {});
+        setTimeout(() => { if (v.readyState < 2) videoTrouble(id, c, v); }, 8000);
+        return;
+      }
+    } catch {}
+  }
+  if (c._explained) return;
+  c._explained = true;
+  let why = 'It didn’t load.';
+  const code = v.error?.code;
+  if (code === 4) why = 'Your phone’s browser can’t play this video format.';
+  else if (code === 3) why = 'The video file looks damaged.';
+  if (it.local && it.blob) {
+    try { await it.blob.slice(0, 64).arrayBuffer(); }
+    catch { why = 'The saved copy got lost by the browser. Delete it and add it again.'; }
+  }
+  const mb = it.blob ? ` · ${(it.blob.size / 1048576).toFixed(0)} MB` : '';
+  const type = it.blob?.type ? ` · ${it.blob.type}` : '';
+  c.querySelector('video')?.pause();
+  c.innerHTML = `<div class="err">⚠️<br>Couldn’t play this video.<br>${why}<br><small>${(it.name || '').replace(/[<>&]/g, '')}${type}${mb}${code ? ' · error ' + code : ''}</small></div>`;
+  if (c === card) updateUI();
+}
+
 /* ---------- rendering ---------- */
 let slots = [], pair = false, anim = null;
 const W = () => stage.clientWidth || innerWidth;
@@ -498,7 +551,13 @@ function render() {
   want.forEach(c => { if (!c.isConnected) stage.appendChild(c); });
   want.forEach(c => { if (c !== card) c.querySelector('video')?.pause(); });
   const vid = card.querySelector('video');
-  if (vid && !atHome) { vid.muted = muted; vid.play().catch(() => {}); }
+  if (vid && !atHome) {
+    vid.muted = muted;
+    vid.play().catch(() => { if (vid.readyState >= 2) card._vset?.('paused'); });
+    const c = card, id = curId;
+    clearTimeout(videoWatch);
+    videoWatch = setTimeout(() => { if (c === card && (vid.readyState < 2 || vid.error)) videoTrouble(id, c, vid); }, 7000);
+  }
   if (watchId !== curId) { stopWatch(); startWatch(); }
   updateUI(); saveCur(); prune(); thumbsSoon();
 }
@@ -657,7 +716,7 @@ function tap(e) {
     lastTap = now;
     tapTimer = setTimeout(() => {
       const v = curVideo();
-      if (v) v.paused ? v.play() : v.pause();
+      if (v) v.paused ? v.play().catch(() => toast('Video can’t play yet', 1500)) : v.pause();
     }, 300);
   }
 }
@@ -938,7 +997,7 @@ $('#bkFile').addEventListener('change', async e => {
 });
 
 /* ---------- updates: the page checks GitHub for a newer version of itself ---------- */
-const APP_VERSION = '6';
+const APP_VERSION = '7';
 async function checkUpdate() {
   try {
     const res = await fetch(location.pathname + '?check=' + Date.now(), { cache: 'no-store' });
