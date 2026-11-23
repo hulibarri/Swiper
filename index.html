@@ -61,6 +61,8 @@ h1{font-size:18px;font-weight:700;letter-spacing:.5px}
 #menu .small{color:var(--muted);font-size:13px;line-height:1.45}
 #menu .wide{width:100%;height:46px;font-size:15px}
 #menu .main{background:var(--accent)}
+#update{position:fixed;left:50%;top:calc(env(safe-area-inset-top) + 66px);transform:translateX(-50%);z-index:15;background:var(--accent);height:42px;padding:0 18px;font-weight:600;box-shadow:0 4px 18px #0008}
+#update[hidden]{display:none}
 #toast{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#000c;padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;z-index:9;pointer-events:none}
 #toast.show{opacity:1}
 .burst{position:fixed;font-size:90px;color:var(--accent);pointer-events:none;z-index:8;transform:translate(-50%,-50%) scale(.3);opacity:0;animation:pop .7s ease-out forwards}
@@ -119,9 +121,11 @@ input[type=file]{display:none}
     <label class="btn wide" for="bkFile">⬆️ Restore backup</label>
     <input type="file" id="bkFile" accept=".json,application/json">
     <p class="small" id="bkLast"></p>
+    <button class="btn wide" id="reloadBtn">🔄 Reload app</button>
     <button class="btn wide" id="menuClose">Close</button>
   </div>
 </div>
+<button class="btn" id="update" hidden>✨ New version — tap to update</button>
 <div id="undo" hidden><span>Deleted</span><button class="btn" id="undoBtn">Undo</button></div>
 <div id="toast"></div>
 
@@ -916,8 +920,27 @@ $('#bkFile').addEventListener('change', async e => {
     (r.missing ? ` · ${r.missing} photos aren’t here yet — add them and they’ll pick it up automatically` : ''), 6000);
 });
 
+/* ---------- updates: the page checks GitHub for a newer version of itself ---------- */
+const APP_VERSION = '5';
+async function checkUpdate() {
+  try {
+    const res = await fetch(location.pathname + '?check=' + Date.now(), { cache: 'no-store' });
+    const m = (await res.text()).match(/const APP_VERSION = '([^']+)'/);
+    if (m && m[1] !== APP_VERSION) $('#update').hidden = false;
+  } catch {}
+}
+function reloadFresh() {
+  finalizeDelete(); stopWatch(); save('stats', stats); saveState();
+  location.replace(location.pathname + '?v=' + Date.now());
+}
+$('#update').onclick = reloadFresh;
+$('#reloadBtn').onclick = reloadFresh;
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkUpdate(); });
+setTimeout(checkUpdate, 3000);
+
 /* ---------- startup ---------- */
 (async function init() {
+  if (/[?&]v=/.test(location.search) && !/reset/.test(location.search)) history.replaceState(null, '', location.pathname);
   // Visit the site with ?reset on the end to clear the saved position (keeps photos & favorites)
   if (/[?&]reset\b/.test(location.search)) {
     localStorage.removeItem('state'); localStorage.removeItem('cur');
