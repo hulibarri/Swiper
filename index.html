@@ -15,7 +15,7 @@ header{top:0;padding-top:calc(env(safe-area-inset-top) + 10px);background:linear
 footer{bottom:0;padding-top:50px;padding-bottom:calc(env(safe-area-inset-bottom) + 14px);background:linear-gradient(transparent,#000c);justify-content:space-between}
 h1{font-size:18px;font-weight:700;letter-spacing:.5px}
 .row{display:flex;gap:8px;align-items:center}
-.btn{background:#ffffff22;border:0;color:var(--fg);font:inherit;font-size:15px;min-width:40px;height:40px;padding:0 12px;border-radius:999px;cursor:pointer;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:inline-flex;align-items:center;justify-content:center}
+.btn{background:#26262bd9;border:0;color:var(--fg);font:inherit;font-size:15px;min-width:40px;height:40px;padding:0 12px;border-radius:999px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
 .btn.on{background:var(--accent)}
 .btn[hidden]{display:none}
 #fav{font-size:22px}
@@ -23,7 +23,7 @@ h1{font-size:18px;font-weight:700;letter-spacing:.5px}
 #counter{color:var(--muted);font-size:14px;font-variant-numeric:tabular-nums}
 
 #stage{position:fixed;inset:0;touch-action:none;overflow:hidden;background:var(--bg)}
-.card{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--bg);will-change:transform}
+.card{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--bg);will-change:transform;contain:strict;backface-visibility:hidden}
 .card .fg,.card video{position:relative;max-width:100%;max-height:100%;object-fit:contain;pointer-events:none}
 .card .bg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 
@@ -72,6 +72,7 @@ input[type=file]{display:none}
 <header>
   <h1>Shuffle</h1>
   <div class="row">
+    <button class="btn" id="fyBtn" title="For You">✨</button>
     <button class="btn" id="favOnly" title="Show favorites only">★</button>
     <button class="btn" id="shuffle" title="Reshuffle">🔀</button>
     <label class="btn" for="file" title="Add photos/videos">＋</label>
@@ -110,17 +111,21 @@ input[type=file]{display:none}
 const timeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 const dbp = timeout(new Promise((res, rej) => {
   let r;
-  try { r = indexedDB.open('shuffle-db', 1); } catch (e) { return rej(e); }
-  r.onupgradeneeded = () => r.result.createObjectStore('media', { keyPath: 'id' });
+  try { r = indexedDB.open('shuffle-db', 2); } catch (e) { return rej(e); }
+  r.onupgradeneeded = () => {
+    const db = r.result;
+    if (!db.objectStoreNames.contains('media')) db.createObjectStore('media', { keyPath: 'id' });
+    if (!db.objectStoreNames.contains('thumbs')) db.createObjectStore('thumbs', { keyPath: 'id' });
+  };
   r.onsuccess = () => res(r.result);
   r.onerror = () => rej(r.error);
 }), 5000);
 dbp.catch(() => {});
-async function idb(mode, fn) {
+async function idb(mode, fn, store = 'media') {
   const db = await dbp;
   return timeout(new Promise((res, rej) => {
-    const t = db.transaction('media', mode);
-    const req = fn(t.objectStore('media'));
+    const t = db.transaction(store, mode);
+    const req = fn(t.objectStore(store));
     t.oncomplete = () => res(req && req.result);
     t.onerror = () => rej(t.error);
     t.onabort = () => rej(t.error);
@@ -130,6 +135,9 @@ const idbAll = () => idb('readonly', s => s.getAll());
 const idbPut = v => idb('readwrite', s => s.put(v));
 const idbPutMany = list => idb('readwrite', s => { list.forEach(v => s.put(v)); });
 const idbDel = id => idb('readwrite', s => s.delete(id));
+const thumbAll = () => idb('readonly', s => s.getAll(), 'thumbs');
+const thumbPut = v => idb('readwrite', s => s.put(v), 'thumbs');
+const thumbDel = id => idb('readwrite', s => s.delete(id), 'thumbs');
 navigator.storage?.persist?.();
 
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d } catch { return d } };
@@ -153,8 +161,10 @@ const favs = new Set(load('favs', []));
 const fpMap = load('fps', {});     // id -> fingerprint, used to spot duplicates
 const saveFps = () => save('fps', fpMap);
 const saveFavs = () => save('favs', [...favs]);
-const saveState = () => save('state', { order, curId, favOnly });
-const view = () => favOnly ? order.filter(id => favs.has(id)) : order;
+const saveState = () => { save('state', { order, curId, favOnly, fy }); save('cur', curId); };
+const saveCur = () => save('cur', curId);
+let fy = false, feed = [];          // For You mode + its running feed
+const view = () => fy ? feed : favOnly ? order.filter(id => favs.has(id)) : order;
 const current = () => items.get(curId);
 const curVideo = () => card?.querySelector('video');
 const typeOf = p => /\.(mp4|webm|mov|m4v|ogv)$/i.test(p) ? 'video' : 'image';
@@ -169,6 +179,113 @@ function shuffle(a) {
 }
 function insertRandom(id) {
   order.splice(Math.floor(Math.random() * (order.length + 1)), 0, id);
+}
+
+/* ---------- For You: logs what you watch in every mode, then suggests from it ---------- */
+const stats = load('stats', {});   // id -> [views, watchMs, quickSkips, lastSeen, videoLengthMs]
+let statsTimer;
+const saveStatsSoon = () => { clearTimeout(statsTimer); statsTimer = setTimeout(() => save('stats', stats), 2000); };
+let watchId = null, watchStart = 0;
+function startWatch() {
+  if (document.hidden || !curId) return;
+  watchId = curId; watchStart = performance.now();
+}
+function stopWatch() {
+  if (!watchId) return;
+  const id = watchId, ms = performance.now() - watchStart, it = items.get(id);
+  watchId = null;
+  if (!it) return;
+  const s = stats[id] ||= [0, 0, 0, 0, 0];
+  const v = it.type === 'video' ? cache.get(id)?.querySelector('video') : null;
+  if (v && isFinite(v.duration) && v.duration > 0) s[4] = Math.round(v.duration * 1000);
+  const cap = it.type === 'video' ? Math.max(30000, (s[4] || 30000) * 3) : 60000;   // ignore "fell asleep on it"
+  s[0]++; s[1] += Math.min(ms, cap);
+  if (ms < 800) s[2]++;
+  s[3] = Date.now();
+  saveStatsSoon();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { stopWatch(); save('stats', stats); } else startWatch();
+});
+addEventListener('pagehide', () => { stopWatch(); save('stats', stats); });
+
+// how into something you seem, before randomness
+function baseScore(id) {
+  const it = items.get(id), s = stats[id];
+  let score;
+  if (!s || !s[0]) score = 1.2;                         // never seen: worth a look
+  else {
+    const avg = s[1] / s[0];
+    const engage = it?.type === 'video' && s[4]
+      ? Math.min(2, avg / s[4])                         // share of the video you watch (loops count)
+      : Math.min(2, avg / 4000);                        // ~4s on a photo = solid interest
+    score = 0.6 + 1.4 * engage + 0.3 * Math.log1p(s[0]) - 0.9 * (s[2] / s[0]);
+  }
+  if (favs.has(id)) score += 1.5;
+  return score;
+}
+// photos taken around the same time (IMG_1234 next to IMG_1240) get a boost when you liked one of them
+const collator = new Intl.Collator(undefined, { numeric: true });
+function similarBoosts() {
+  const ids = [...items.keys()].sort((a, b) => collator.compare(items.get(a).name || a, items.get(b).name || b));
+  const boost = new Map();
+  ids.forEach((id, p) => {
+    if (!(favs.has(id) || baseScore(id) >= 2.2)) return;
+    for (let d = -8; d <= 8; d++) {
+      const other = ids[p + d];
+      if (!other || d === 0) continue;
+      boost.set(other, Math.max(boost.get(other) || 0, 1 - Math.abs(d) / 9));
+    }
+  });
+  return boost;
+}
+function weight(id, now, boost) {
+  let w = baseScore(id) + 0.8 * (boost.get(id) || 0);
+  const seen = stats[id]?.[3];
+  if (seen) {                                           // just saw it? let it rest
+    const ago = now - seen;
+    if (ago < 10 * 60e3) w *= 0.15; else if (ago < 60 * 60e3) w *= 0.5; else if (ago < 6 * 3600e3) w *= 0.8;
+  }
+  return Math.max(0.05, w) ** 1.5;
+}
+function extendFeed(count = 20) {
+  const now = Date.now(), boost = similarBoosts();
+  const i = Math.max(0, feed.indexOf(curId));
+  const block = new Set(feed.slice(i - 2 < 0 ? 0 : i - 2));                       // what's on screen / coming up
+  feed.slice(-Math.min(40, Math.floor(items.size * 0.6))).forEach(id => block.add(id)); // and the recent past
+  let pool = [...items.keys()].filter(id => !block.has(id));
+  if (!pool.length) pool = [...items.keys()].filter(id => !feed.slice(Math.max(0, i - 2)).includes(id));
+  const w = pool.map(id => weight(id, now, boost));
+  const picks = [];
+  while (picks.length < count && pool.length) {
+    let k;
+    if (Math.random() < 0.2) {                          // 1 in 5: explore something you've barely seen
+      const views = pool.map(id => stats[id]?.[0] || 0), min = Math.min(...views);
+      const low = views.map((v, j) => v <= min + 1 ? j : -1).filter(j => j >= 0);
+      k = low[Math.floor(Math.random() * low.length)];
+    } else {                                            // otherwise weighted random, never just "top watched"
+      let r = Math.random() * w.reduce((a, b) => a + b, 0);
+      k = 0;
+      while ((r -= w[k]) > 0 && k < w.length - 1) k++;
+    }
+    picks.push(pool[k]); pool.splice(k, 1); w.splice(k, 1);
+  }
+  const ps = new Set(picks);
+  feed = feed.filter(id => !ps.has(id));                // each item appears once in the feed
+  feed.push(...picks);
+  if (feed.length > 400) {
+    const cut = feed.length - 400;
+    if (feed.indexOf(curId) > cut + 5) feed = feed.slice(cut);
+  }
+}
+function ensureFeed() {
+  if (!items.size) { feed = []; return; }
+  feed = feed.filter(id => items.has(id));
+  if (!feed.includes(curId)) {
+    feed = curId && items.has(curId) ? [curId] : [];
+    extendFeed();
+    if (!feed.includes(curId)) curId = feed[0];
+  } else if (feed.length - feed.indexOf(curId) < 5) extendFeed();
 }
 
 /* ---------- cards: current + neighbors live side by side, ready to slide in ---------- */
@@ -202,23 +319,26 @@ function getCard(id) {
       } catch {}
     }, { once: true });
     fg.addEventListener('error', fail, { once: true });
-    fg.src = item.src;
+    fg.src = item.thumb || item.src;
     c.append(bg, fg);
     fg.decode?.().catch(() => {});
   }
   cache.set(id, c);
   return c;
 }
-function neighbors() {
+function slotIds() {               // what should sit on stage: [id, offset from current]
   const v = view(), n = v.length, i = v.indexOf(curId);
   if (!n || i < 0) return [];
-  const ids = [v[i], v[(i + 1) % n], v[(i - 1 + n) % n]];
-  for (const k of [2, -2]) {                       // images are cheap: get 2 ahead/behind ready too
-    const id = v[(i + k + n * 2) % n];
-    if (items.get(id)?.type === 'image') ids.push(id);
+  if (n === 2) return [[v[i], 0], [v[1 - i], 1]];
+  const K = Math.min(2, Math.floor((n - 1) / 2));
+  const out = [];
+  for (let k = -K; k <= K; k++) {
+    const id = v[(i + k + n * 3) % n];
+    if (Math.abs(k) <= 1 || items.get(id)?.type === 'image') out.push([id, k]);   // 2 away: images only
   }
-  return [...new Set(ids)];
+  return out;
 }
+function neighbors() { return slotIds().map(s => s[0]); }
 function preload() { neighbors().forEach(getCard); }
 function prune() {
   const keep = new Set(neighbors());
@@ -230,39 +350,117 @@ function prune() {
   }
 }
 
-/* ---------- rendering ---------- */
-let prevEl = null, nextEl = null, anim = null;
-const W = () => stage.clientWidth || innerWidth;
-function place(el, pos, dx, animate) {
-  if (!el) return;
-  el.style.transition = animate ? 'transform .2s cubic-bezier(.25,.8,.25,1)' : 'none';
-  el.style.transform = `translate3d(${pos * W() + dx}px,0,0)`;
+/* ---------- screen-sized copies (made in the background, originals untouched) ---------- */
+const THUMB_MAX = Math.round(Math.min(2400, Math.max(screen.width, screen.height) * Math.min(devicePixelRatio || 1, 2)));
+const workerSrc = `self.onmessage = async e => {
+  const { id, blob, max } = e.data;
+  try {
+    const b = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+    const s = Math.min(1, max / Math.max(b.width, b.height));
+    if (s >= 1 && blob.size < 700000) { b.close(); self.postMessage({ id, none: true }); return; }
+    const w = Math.round(b.width * s), h = Math.round(b.height * s);
+    const c = new OffscreenCanvas(w, h);
+    c.getContext('2d').drawImage(b, 0, 0, w, h); b.close();
+    self.postMessage({ id, blob: await c.convertToBlob({ type: 'image/jpeg', quality: 0.85 }) });
+  } catch (err) { self.postMessage({ id, error: String(err) }); }
+};`;
+let worker = null;
+try {
+  if (typeof OffscreenCanvas !== 'undefined')
+    worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' })));
+} catch {}
+const waiting = new Map();
+if (worker) worker.onmessage = e => { const r = waiting.get(e.data.id); waiting.delete(e.data.id); r?.(e.data); };
+
+async function thumbOnMainThread(blob) {
+  const img = new Image();
+  const url = URL.createObjectURL(blob);
+  try {
+    img.src = url; await img.decode();
+    const s = Math.min(1, THUMB_MAX / Math.max(img.naturalWidth, img.naturalHeight));
+    if (s >= 1 && blob.size < 700000) return { none: true };
+    const w = Math.round(img.naturalWidth * s), h = Math.round(img.naturalHeight * s);
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').drawImage(img, 0, 0, w, h);
+    return { blob: await new Promise(r => c.toBlob(r, 'image/jpeg', 0.85)) };
+  } finally { URL.revokeObjectURL(url); }
 }
-function layout(dx = 0, animate = false) {
-  place(card, 0, dx, animate);
-  if (prevEl && prevEl === nextEl) place(nextEl, dx > 0 ? -1 : 1, dx, animate);   // only 2 items
-  else { place(prevEl, -1, dx, animate); place(nextEl, 1, dx, animate); }
+async function makeThumb(it) {
+  if (worker) {
+    const res = await new Promise(r => { waiting.set(it.id, r); worker.postMessage({ id: it.id, blob: it.blob, max: THUMB_MAX }); });
+    if (!res.error) return res;
+  }
+  return thumbOnMainThread(it.blob);
+}
+const thumbFailed = new Set();
+const needsThumb = it => it && it.local && it.type === 'image' && it.blob && !it.thumb && !it.noThumb && !thumbFailed.has(it.id);
+async function thumbOne(it) {
+  try {
+    const res = await makeThumb(it);
+    if (!items.has(it.id)) return;
+    if (res.none || !res.blob) { it.noThumb = true; await thumbPut({ id: it.id, none: true }); return; }
+    await thumbPut({ id: it.id, blob: res.blob });
+    it.thumb = URL.createObjectURL(res.blob);
+    const c = cache.get(it.id), fg = c?.querySelector('.fg');
+    if (fg && c !== card) { fg.src = it.thumb; fg.decode?.().catch(() => {}); }   // swap only if offscreen
+  } catch { thumbFailed.add(it.id); }
+}
+let thumbBusy = false, thumbTimer;
+function thumbsSoon(ms = 300) { clearTimeout(thumbTimer); thumbTimer = setTimeout(thumbLoop, ms); }
+async function thumbLoop() {
+  if (thumbBusy) return;
+  thumbBusy = true;
+  try {
+    while (!down && !anim && !uploading) {
+      // nearby photos first, then the next dozen, then everything else
+      let it = neighbors().map(id => items.get(id)).find(needsThumb);
+      if (!it) {
+        const v = view(), n = v.length, i = v.indexOf(curId);
+        for (let k = 3; k < Math.min(n, 15) && !it; k++) { const a = items.get(v[(i + k) % n]); if (needsThumb(a)) it = a; }
+        for (let k = 1; k < Math.min(n, 15) && !it; k++) { const a = items.get(v[(i - k + n * 15) % n]); if (needsThumb(a)) it = a; }
+      }
+      if (!it) for (const a of items.values()) if (needsThumb(a)) { it = a; break; }
+      if (!it) return;
+      await thumbOne(it);
+      await new Promise(r => setTimeout(r, worker ? 10 : 60));
+    }
+  } finally { thumbBusy = false; }
+  thumbsSoon(500);   // paused because you were swiping; pick up again shortly
+}
+
+/* ---------- rendering ---------- */
+let slots = [], pair = false, anim = null;
+const W = () => stage.clientWidth || innerWidth;
+function layout(dx = 0, dur = 0) {
+  const w = W();
+  for (const { el, pos } of slots) {
+    const p = pair && pos !== 0 ? (dx > 0 ? -1 : 1) : pos;     // with only 2 items the other one goes wherever you swipe
+    el.style.transition = dur ? `transform ${dur}ms cubic-bezier(.2,.75,.3,1)` : 'none';
+    el.style.transform = `translate3d(${p * w + dx}px,0,0)`;
+  }
 }
 function render() {
+  if (fy) ensureFeed();
   const v = view();
   if (!v.length) {
+    stopWatch();
     [...stage.children].forEach(c => { c.querySelector('video')?.pause(); c.remove(); });
-    card = prevEl = nextEl = null;
+    card = null; slots = [];
     updateUI(); saveState(); return;
   }
   if (!v.includes(curId)) curId = v[0];
-  const n = v.length, i = v.indexOf(curId);
-  card = getCard(curId);
-  prevEl = n > 1 ? getCard(v[(i - 1 + n) % n]) : null;
-  nextEl = n > 1 ? getCard(v[(i + 1) % n]) : null;
-  const want = new Set([card, prevEl, nextEl].filter(Boolean));
+  pair = v.length === 2;
+  slots = slotIds().map(([id, pos]) => ({ el: getCard(id), pos }));
+  card = slots.find(s => s.pos === 0).el;
+  const want = new Set(slots.map(s => s.el));
   [...stage.children].forEach(c => { if (!want.has(c)) { c.querySelector('video')?.pause(); c.remove(); } });
-  want.forEach(c => { if (!c.isConnected) stage.appendChild(c); });
   layout(0);
+  want.forEach(c => { if (!c.isConnected) stage.appendChild(c); });
   want.forEach(c => { if (c !== card) c.querySelector('video')?.pause(); });
   const vid = card.querySelector('video');
   if (vid) { vid.muted = muted; vid.play().catch(() => {}); }
-  updateUI(); saveState(); preload(); prune();
+  if (watchId !== curId) { stopWatch(); startWatch(); }
+  updateUI(); saveCur(); prune(); thumbsSoon();
 }
 function finishAnim() {
   if (!anim) return false;
@@ -272,24 +470,25 @@ function finishAnim() {
   return true;
 }
 function show() { if (!finishAnim()) render(); }
-function go(dir) {                 // +1 = next, -1 = previous
+function go(dir, speed = 0, fromDx = 0) {   // +1 = next, -1 = previous
   finishAnim();
   const v = view();
-  if (v.length < 2) { layout(0, true); return; }
+  if (v.length < 2) { layout(0, 180); return; }
   const i = v.indexOf(curId);
   const toId = v[(i + dir + v.length) % v.length];
   card?.querySelector('video')?.pause();
-  layout(-dir * W(), true);
-  anim = { toId, timer: setTimeout(finishAnim, 200) };
+  const left = Math.max(0, W() - Math.abs(fromDx));
+  const dur = speed > 0.3 ? Math.max(90, Math.min(220, left / speed)) : 220;   // fast flick = fast finish
+  layout(-dir * W(), Math.round(dur));
+  anim = { toId, timer: setTimeout(finishAnim, dur + 10) };
 }
-
 function updateUI() {
   const v = view(), it = current(), has = !!card;
   $('#empty').hidden = has;
   $('#emptyText').innerHTML = notice || (items.size
     ? 'No favorites yet.<br>Double-tap something you love ♥'
     : 'Tap <b>+</b> to add photos &amp; videos');
-  $('#counter').textContent = has ? `${v.indexOf(curId) + 1} / ${v.length}` : '';
+  $('#counter').textContent = !has ? '' : fy ? '✨ For You' : `${v.indexOf(curId) + 1} / ${v.length}`;
   const isFav = has && favs.has(curId);
   $('#fav').textContent = isFav ? '♥' : '♡';
   $('#fav').classList.toggle('on', isFav);
@@ -301,6 +500,7 @@ function updateUI() {
   $('#scrub').hidden = !isVid;
   if (isVid) { seek.value = 0; seek.style.setProperty('--p', '0%'); $('#tcur').textContent = '0:00'; $('#tdur').textContent = ''; }
   $('#favOnly').classList.toggle('on', favOnly);
+  $('#fyBtn').classList.toggle('on', fy);
 }
 
 let toastT;
@@ -374,7 +574,7 @@ function toggleFav(forceOn = false) {
 }
 
 /* ---------- swipe & tap ---------- */
-let sx = 0, sy = 0, dx = 0, down = false, t0 = 0, px = 0, pt = 0, vel = 0, lastTap = 0, tapTimer;
+let sx = 0, sy = 0, dx = 0, down = false, t0 = 0, px = 0, pt = 0, vel = 0, lastTap = 0, tapTimer, raf = 0;
 stage.addEventListener('pointerdown', e => {
   if (!card) return;
   finishAnim();
@@ -387,19 +587,25 @@ stage.addEventListener('pointermove', e => {
   if (now > pt) vel = 0.6 * vel + 0.4 * ((e.clientX - px) / (now - pt));
   px = e.clientX; pt = now;
   dx = e.clientX - sx;
-  layout(view().length < 2 ? dx * 0.3 : dx);
+  if (!raf) raf = requestAnimationFrame(() => {      // move once per screen refresh, never more
+    raf = 0;
+    if (down) layout(view().length < 2 ? dx * 0.3 : dx);
+  });
 });
 stage.addEventListener('pointerup', e => {
   if (!down) return;
   down = false;
-  const flick = Math.abs(vel) > 0.35 && Math.abs(dx) > 15;     // quick flick counts too
-  if (Math.abs(dx) > W() * 0.2 || flick) go((flick ? -vel : -dx) > 0 ? 1 : -1);
-  else {
-    layout(0, true);
+  cancelAnimationFrame(raf); raf = 0;
+  const flick = Math.abs(vel) > 0.3 && Math.abs(dx) > 12;    // quick flick counts too
+  if (Math.abs(dx) > W() * 0.2 || flick) {
+    const dir = (flick ? -vel : -dx) > 0 ? 1 : -1;
+    go(dir, Math.abs(vel), dx);
+  } else {
+    layout(0, 180);
     if (Math.abs(dx) < 8 && Math.abs(e.clientY - sy) < 8 && performance.now() - t0 < 300) tap(e);
   }
 });
-stage.addEventListener('pointercancel', () => { down = false; layout(0, true); });
+stage.addEventListener('pointercancel', () => { down = false; cancelAnimationFrame(raf); raf = 0; layout(0, 180); });
 addEventListener('resize', () => layout(0));
 
 function tap(e) {
@@ -426,13 +632,28 @@ document.addEventListener('keydown', e => {
 /* ---------- buttons ---------- */
 $('#fav').onclick = () => toggleFav();
 $('#favOnly').onclick = () => {
-  favOnly = !favOnly;
+  favOnly = !favOnly; fy = false;
   toast(favOnly ? 'Favorites only' : 'Showing everything');
-  show();
+  saveState(); show();
+};
+$('#fyBtn').onclick = () => {
+  finishAnim();
+  fy = !fy; favOnly = false;
+  if (fy) { feed = curId ? [curId] : []; }       // start a fresh feed from what you're looking at
+  toast(fy ? '✨ For You' : 'Showing everything');
+  saveState(); show();
 };
 $('#shuffle').onclick = () => {
   if (!order.length) return;
-  shuffle(order); curId = view()[0]; show(1); toast('Shuffled 🔀');
+  finishAnim();
+  if (fy) {                                       // new batch of suggestions
+    const i = feed.indexOf(curId);
+    feed = feed.slice(0, i + 1);
+    extendFeed();
+    curId = feed[i + 1] ?? curId;
+    show(); toast('Fresh picks ✨'); return;
+  }
+  shuffle(order); curId = view()[0]; saveState(); show(1); toast('Shuffled 🔀');
 };
 $('#mute').onclick = () => {
   muted = !muted;
@@ -450,8 +671,11 @@ function finalizeDelete() {
   clearTimeout(undoTimer);
   $('#undo').hidden = true;
   idbDel(it.id).catch(() => {});
+  thumbDel(it.id).catch(() => {});
   URL.revokeObjectURL(it.src);
+  if (it.thumb) URL.revokeObjectURL(it.thumb);
   delete fpMap[it.id]; saveFps();
+  delete stats[it.id]; saveStatsSoon();
 }
 $('#del').onclick = () => {
   const it = current();
@@ -464,7 +688,9 @@ $('#del').onclick = () => {
   const wasFav = favs.delete(it.id); saveFavs();
   items.delete(it.id);
   order = order.filter(id => id !== it.id);
-  pending = { it, oi, wasFav };
+  const fi = feed.indexOf(it.id);
+  feed = feed.filter(id => id !== it.id);
+  pending = { it, oi, wasFav, fi };
   const nv = view();
   curId = nv.length ? nv[Math.min(i, nv.length - 1)] : null;
   card = null;
@@ -481,6 +707,7 @@ $('#undoBtn').onclick = () => {
   $('#undo').hidden = true;
   items.set(it.id, it);
   order.splice(Math.min(oi, order.length), 0, it.id);
+  if (fy) feed.splice(Math.max(0, feed.indexOf(curId)), 0, it.id);
   if (wasFav) { favs.add(it.id); saveFavs(); }
   if (favOnly && !wasFav) favOnly = false;
   curId = it.id;
@@ -562,7 +789,7 @@ $('#file').addEventListener('change', async e => {
     try {
       if (recs.length) await idbPutMany(recs);
       for (const r of recs) {
-        items.set(r.id, { id: r.id, type: r.type, src: URL.createObjectURL(r.blob), blob: r.blob, local: true });
+        items.set(r.id, { id: r.id, type: r.type, src: URL.createObjectURL(r.blob), blob: r.blob, name: r.name, local: true });
         if (fps[r.id]) fpMap[r.id] = fps[r.id];
         insertRandom(r.id); first ??= r.id; added++;
       }
@@ -579,6 +806,7 @@ $('#file').addEventListener('change', async e => {
 
   progressDone();
   uploading = false;
+  thumbsSoon(800);
   try { await wakeLock?.release(); } catch {}
   wakeLock = null;
   if (first && favOnly) { favOnly = false; curId = first; show(); }
@@ -593,7 +821,7 @@ $('#file').addEventListener('change', async e => {
 (async function init() {
   // Visit the site with ?reset on the end to clear the saved position (keeps photos & favorites)
   if (/[?&]reset\b/.test(location.search)) {
-    localStorage.removeItem('state');
+    localStorage.removeItem('state'); localStorage.removeItem('cur');
     history.replaceState(null, '', location.pathname);
     toast('Reset ✓', 1500);
   }
@@ -607,7 +835,7 @@ $('#file').addEventListener('change', async e => {
   for (const r of rows) {
     try {
       if (!r || !r.blob) continue;
-      items.set(r.id, { id: r.id, type: r.type, src: URL.createObjectURL(r.blob), blob: r.blob, local: true });
+      items.set(r.id, { id: r.id, type: r.type, src: URL.createObjectURL(r.blob), blob: r.blob, name: r.name, local: true });
     } catch {}
   }
   if (!notice) {   // forget fingerprints of things that no longer exist
@@ -615,20 +843,31 @@ $('#file').addEventListener('change', async e => {
     saveFps();
   }
 
+  // screen-sized copies made earlier
+  let trows;
+  try { trows = await wait(thumbAll(), 6000); } catch {}
+  if (Array.isArray(trows)) for (const t of trows) {
+    const it = items.get(t.id);
+    if (!it) { if (!notice) thumbDel(t.id).catch(() => {}); continue; }
+    if (t.none) it.noThumb = true;
+    else if (t.blob) try { it.thumb = URL.createObjectURL(t.blob); } catch {}
+  }
+
   // Optional: files committed to the repo, listed in media.json, e.g. ["media/beach.jpg","media/clip.mp4"]
   try {
     const res = await fetch('media.json', { cache: 'no-store' });
     if (res.ok) for (const p of await res.json()) {
       const id = 'repo:' + p;
-      items.set(id, { id, type: typeOf(p), src: p, local: false });
+      items.set(id, { id, type: typeOf(p), src: p, name: p, local: false });
     }
   } catch {}
 
   const st = load('state', null);
   if (st) {
     order = (st.order || []).filter(id => items.has(id));
-    curId = st.curId; favOnly = !!st.favOnly;
+    curId = st.curId; favOnly = !!st.favOnly; fy = !!st.fy && !favOnly;
   }
+  curId = load('cur', curId);
   const fresh = shuffle([...items.keys()].filter(id => !order.includes(id)));
   if (!order.length) order = fresh; else fresh.forEach(insertRandom);
   for (const id of [...favs]) if (!items.has(id)) favs.delete(id);
