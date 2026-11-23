@@ -12,7 +12,7 @@
 html,body{height:100%;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden;overscroll-behavior:none;user-select:none;-webkit-user-select:none}
 header,footer{position:fixed;left:0;right:0;display:flex;align-items:center;gap:8px;padding:10px 14px;z-index:5}
 header{top:0;padding-top:calc(env(safe-area-inset-top) + 10px);background:linear-gradient(#000b,transparent);justify-content:space-between}
-footer{bottom:0;padding-bottom:calc(env(safe-area-inset-bottom) + 14px);background:linear-gradient(transparent,#000b);justify-content:space-between}
+footer{bottom:0;padding-top:50px;padding-bottom:calc(env(safe-area-inset-bottom) + 14px);background:linear-gradient(transparent,#000c);justify-content:space-between}
 h1{font-size:18px;font-weight:700;letter-spacing:.5px}
 .row{display:flex;gap:8px;align-items:center}
 .btn{background:#ffffff22;border:0;color:var(--fg);font:inherit;font-size:15px;min-width:40px;height:40px;padding:0 12px;border-radius:999px;cursor:pointer;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:inline-flex;align-items:center;justify-content:center}
@@ -21,9 +21,24 @@ h1{font-size:18px;font-weight:700;letter-spacing:.5px}
 #fav{font-size:22px}
 #fav.on{background:transparent;color:var(--accent)}
 #counter{color:var(--muted);font-size:14px;font-variant-numeric:tabular-nums}
-#stage{position:fixed;inset:0;touch-action:none;overflow:hidden}
-.card{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;will-change:transform}
-.card img,.card video{max-width:100%;max-height:100%;object-fit:contain;pointer-events:none}
+
+#stage{position:fixed;inset:0;touch-action:none;overflow:hidden;background:var(--bg)}
+.card{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--bg);will-change:transform}
+.card .fg,.card video{position:relative;max-width:100%;max-height:100%;object-fit:contain;pointer-events:none}
+.card .bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(28px) brightness(.45);transform:scale(1.2);pointer-events:none}
+
+/* video timeline */
+#scrub{position:fixed;left:0;right:0;bottom:calc(env(safe-area-inset-bottom) + 64px);display:flex;gap:10px;align-items:center;padding:0 16px;z-index:6;font-size:13px;color:#e4e4e7;font-variant-numeric:tabular-nums;touch-action:none}
+#scrub[hidden]{display:none}
+#scrub span{min-width:38px;text-align:center}
+#seek{flex:1;-webkit-appearance:none;appearance:none;height:40px;background:transparent;margin:0;touch-action:none;--p:0%}
+#seek:focus{outline:none}
+#seek::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:linear-gradient(to right,#fff var(--p),#ffffff40 var(--p))}
+#seek::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:#fff;margin-top:-8px;box-shadow:0 1px 6px #0008}
+#seek::-moz-range-track{height:6px;border-radius:3px;background:#ffffff40}
+#seek::-moz-range-progress{height:6px;border-radius:3px;background:#fff}
+#seek::-moz-range-thumb{width:22px;height:22px;border:0;border-radius:50%;background:#fff}
+
 #empty{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:30px;color:var(--muted);z-index:1}
 #empty[hidden]{display:none}
 #empty .big{font-size:54px}
@@ -51,6 +66,12 @@ input[type=file]{display:none}
     <input type="file" id="file" accept="image/*,video/*" multiple>
   </div>
 </header>
+
+<div id="scrub" hidden>
+  <span id="tcur">0:00</span>
+  <input type="range" id="seek" min="0" max="1000" step="1" value="0" aria-label="Video position">
+  <span id="tdur">0:00</span>
+</div>
 
 <footer>
   <div class="row">
@@ -92,18 +113,22 @@ const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)) } catc
 const $ = s => document.querySelector(s);
 const stage = $('#stage');
 const items = new Map();           // id -> {id,type,src,local}
-let order = [];                    // shuffled ids
+const cache = new Map();           // id -> prebuilt card element (current + neighbors)
+let order = [];
 let curId = null;
 let favOnly = false;
 let muted = true;
 let card = null;
+let showSeq = 0;
 const favs = new Set(load('favs', []));
 
 const saveFavs = () => save('favs', [...favs]);
 const saveState = () => save('state', { order, curId, favOnly });
 const view = () => favOnly ? order.filter(id => favs.has(id)) : order;
 const current = () => items.get(curId);
+const curVideo = () => card?.querySelector('video');
 const typeOf = p => /\.(mp4|webm|mov|m4v|ogv)$/i.test(p) ? 'video' : 'image';
+const wait = (p, ms) => Promise.race([p, new Promise(r => setTimeout(r, ms))]);
 
 function shuffle(a) {
   for (let i = a.length - 1; i > 0; i--) {
@@ -116,48 +141,94 @@ function insertRandom(id) {
   order.splice(Math.floor(Math.random() * (order.length + 1)), 0, id);
 }
 
-/* ---------- rendering ---------- */
-function makeCard(item) {
-  const c = document.createElement('div');
+/* ---------- cards: built ahead of time so swipes are instant ---------- */
+function getCard(id) {
+  let c = cache.get(id);
+  if (c) return c;
+  const item = items.get(id);
+  c = document.createElement('div');
   c.className = 'card';
-  let el;
   if (item.type === 'video') {
-    el = document.createElement('video');
-    el.src = item.src;
-    el.loop = true; el.muted = muted; el.playsInline = true; el.autoplay = true;
-    el.setAttribute('playsinline', '');
+    const v = document.createElement('video');
+    v.src = item.src;
+    v.loop = true; v.muted = muted; v.playsInline = true; v.preload = 'auto';
+    v.setAttribute('playsinline', '');
+    c.appendChild(v);
+    c._ready = new Promise(r => {
+      if (v.readyState >= 2) return r();
+      v.addEventListener('loadeddata', r, { once: true });
+      v.addEventListener('error', r, { once: true });
+    });
   } else {
-    el = document.createElement('img');
-    el.src = item.src; el.draggable = false; el.alt = '';
+    const bg = document.createElement('img');
+    bg.className = 'bg'; bg.src = item.src; bg.alt = ''; bg.draggable = false;
+    const fg = document.createElement('img');
+    fg.className = 'fg'; fg.src = item.src; fg.alt = ''; fg.draggable = false;
+    c.append(bg, fg);
+    c._ready = Promise.all([fg.decode(), bg.decode()]).catch(() => {});
   }
-  c.appendChild(el);
+  cache.set(id, c);
   return c;
 }
+function neighbors() {
+  const v = view(), n = v.length, i = v.indexOf(curId);
+  if (!n || i < 0) return [];
+  const ids = [v[i], v[(i + 1) % n], v[(i - 1 + n) % n]];
+  const two = v[(i + 2) % n];
+  if (items.get(two)?.type === 'image') ids.push(two);   // images are cheap, look 2 ahead
+  return [...new Set(ids)];
+}
+function preload() { neighbors().forEach(getCard); }
+function prune() {
+  const keep = new Set(neighbors());
+  for (const [id, c] of cache) {
+    if (keep.has(id) || c.isConnected) continue;
+    const v = c.querySelector('video');
+    if (v) { v.pause(); v.removeAttribute('src'); v.load(); }
+    cache.delete(id);
+  }
+}
 
-function show(dir = 0) {
+/* ---------- rendering ---------- */
+async function show(dir = 0) {
   const v = view();
   if (!v.length) {
-    if (card) { card.remove(); card = null; }
-    updateUI(); saveState(); return;
+    [...stage.children].forEach(c => c.remove());
+    card = null; updateUI(); saveState(); return;
   }
   if (!v.includes(curId)) curId = v[0];
 
-  const next = makeCard(current());
-  stage.appendChild(next);
-  if (card) {
-    const old = card;
-    old.querySelector('video')?.pause();
-    if (dir) {
-      next.style.transform = `translateX(${dir * 100}%)`;
-      next.getBoundingClientRect();
-      next.style.transition = old.style.transition = 'transform .28s ease';
-      next.style.transform = 'translateX(0)';
-      old.style.transform = `translateX(${-dir * 110}%)`;
-      setTimeout(() => { old.remove(); next.style.transition = ''; }, 300);
-    } else old.remove();
-  }
+  const seq = ++showSeq;
+  const next = getCard(curId);
   card = next;
-  updateUI(); saveState();
+  updateUI(); saveState(); preload();
+
+  await wait(next._ready, 500);           // don't slide in until it's actually drawn
+  if (seq !== showSeq) return;            // user already swiped again
+
+  const olds = [...stage.children].filter(c => c !== next);
+  const animate = dir && olds.length;
+  next.style.transition = 'none';
+  next.style.transform = animate ? `translateX(${dir * 100}%)` : '';
+  if (!next.isConnected) stage.appendChild(next);
+  next.getBoundingClientRect();
+  if (animate) {
+    next.style.transition = 'transform .25s ease';
+    next.style.transform = 'translateX(0)';
+    olds.forEach(o => {
+      o.style.transition = 'transform .25s ease';
+      o.style.transform = `translateX(${-dir * 110}%)`;
+    });
+  }
+  olds.forEach(o => o.querySelector('video')?.pause());
+  const vid = next.querySelector('video');
+  if (vid) { vid.muted = muted; vid.play().catch(() => {}); }
+
+  setTimeout(() => {
+    olds.forEach(o => { if (o !== card) { o.remove(); o.style.transform = ''; o.style.transition = ''; } });
+    if (next === card) next.style.transition = '';
+    prune();
+  }, animate ? 270 : 0);
 }
 
 function go(dir) {
@@ -180,8 +251,11 @@ function updateUI() {
   $('#fav').classList.toggle('on', isFav);
   $('#fav').hidden = !has;
   $('#del').hidden = !(has && it?.local);
-  $('#mute').hidden = !(has && it?.type === 'video');
+  const isVid = has && it?.type === 'video';
+  $('#mute').hidden = !isVid;
   $('#mute').textContent = muted ? '🔇' : '🔊';
+  $('#scrub').hidden = !isVid;
+  if (isVid) { seek.value = 0; seek.style.setProperty('--p', '0%'); $('#tcur').textContent = '0:00'; $('#tdur').textContent = ''; }
   $('#favOnly').classList.toggle('on', favOnly);
 }
 
@@ -198,12 +272,60 @@ function burst(x, y) {
   setTimeout(() => b.remove(), 750);
 }
 
+/* ---------- video timeline ---------- */
+const seek = $('#seek');
+let scrubbing = false, wasPlaying = false;
+const fmt = s => {
+  if (!isFinite(s)) return '0:00';
+  s = Math.floor(s);
+  const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+};
+(function tick() {
+  const v = curVideo();
+  if (v && !scrubbing && v.duration) {
+    const p = v.currentTime / v.duration;
+    seek.value = p * 1000;
+    seek.style.setProperty('--p', p * 100 + '%');
+    $('#tcur').textContent = fmt(v.currentTime);
+    $('#tdur').textContent = fmt(v.duration);
+  }
+  requestAnimationFrame(tick);
+})();
+function startScrub() {
+  const v = curVideo();
+  if (!v || scrubbing) return;
+  scrubbing = true; wasPlaying = !v.paused; v.pause();
+}
+seek.addEventListener('pointerdown', startScrub);
+seek.addEventListener('touchstart', startScrub, { passive: true });
+seek.addEventListener('input', () => {
+  const v = curVideo();
+  if (!v || !v.duration) return;
+  startScrub();
+  const t = seek.value / 1000 * v.duration;
+  if (v.fastSeek) v.fastSeek(t); else v.currentTime = t;
+  seek.style.setProperty('--p', seek.value / 10 + '%');
+  $('#tcur').textContent = fmt(t);
+});
+function endScrub() {
+  if (!scrubbing) return;
+  scrubbing = false;
+  const v = curVideo();
+  if (!v) return;
+  if (v.duration) v.currentTime = seek.value / 1000 * v.duration;   // land exactly where you let go
+  if (wasPlaying) v.play().catch(() => {});
+}
+seek.addEventListener('change', endScrub);
+seek.addEventListener('pointerup', endScrub);
+seek.addEventListener('touchend', endScrub);
+
 /* ---------- favorites ---------- */
 function toggleFav(forceOn = false) {
   if (!curId) return;
   if (favs.has(curId) && !forceOn) favs.delete(curId); else favs.add(curId);
   saveFavs();
-  if (favOnly && !favs.has(curId)) { const v = view(); curId = v[0] ?? null; show(); }
+  if (favOnly && !favs.has(curId)) { curId = view()[0] ?? null; show(); }
   else updateUI();
 }
 
@@ -244,13 +366,14 @@ function tap(e) {
   } else {                             // single tap = play/pause video
     lastTap = now;
     tapTimer = setTimeout(() => {
-      const v = card?.querySelector('video');
+      const v = curVideo();
       if (v) v.paused ? v.play() : v.pause();
     }, 300);
   }
 }
 
 document.addEventListener('keydown', e => {
+  if (e.target === seek) return;
   if (e.key === 'ArrowRight') go(1);
   else if (e.key === 'ArrowLeft') go(-1);
   else if (e.key === 'f') toggleFav();
@@ -269,21 +392,24 @@ $('#shuffle').onclick = () => {
 };
 $('#mute').onclick = () => {
   muted = !muted;
-  const v = card?.querySelector('video');
-  if (v) { v.muted = muted; v.play(); }
+  for (const c of cache.values()) { const v = c.querySelector('video'); if (v) v.muted = muted; }
+  curVideo()?.play().catch(() => {});
   updateUI();
 };
 $('#del').onclick = async () => {
   const it = current();
   if (!it?.local || !confirm('Delete this from the gallery?')) return;
   await idbDel(it.id);
-  URL.revokeObjectURL(it.src);
   const v = view(), i = v.indexOf(it.id);
+  const c = cache.get(it.id);
+  if (c) { c.querySelector('video')?.pause(); c.remove(); cache.delete(it.id); }
+  URL.revokeObjectURL(it.src);
   items.delete(it.id); favs.delete(it.id); saveFavs();
   order = order.filter(id => id !== it.id);
   const nv = view();
   curId = nv.length ? nv[Math.min(i, nv.length - 1)] : null;
-  show(nv.length ? 1 : 0);
+  card = null;
+  show();
   toast('Deleted');
 };
 
@@ -301,7 +427,7 @@ $('#file').addEventListener('change', async e => {
   }
   if (!n) return;
   if (!card || favOnly) { favOnly = false; curId = first; show(); }
-  else { updateUI(); saveState(); }
+  else { updateUI(); saveState(); preload(); }
   toast(`Added ${n} ✨`);
 });
 
