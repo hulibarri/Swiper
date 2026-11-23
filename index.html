@@ -360,6 +360,7 @@ function getCard(id) {
       if (c === card && !atHome) v.play().catch(() => c._vset('paused'));
     });
     v.addEventListener('error', () => videoTrouble(id, c, v));
+    if (item.thumb) v.poster = item.thumb;          // still frame shows instantly
     v.src = item.src;
     c.append(v, ov);
   } else {
@@ -442,7 +443,34 @@ async function thumbOnMainThread(blob) {
     return { blob: await new Promise(r => c.toBlob(r, 'image/jpeg', 0.85)) };
   } finally { URL.revokeObjectURL(url); }
 }
+async function videoPoster(blob) {
+  const v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.preload = 'auto'; v.setAttribute('playsinline', '');
+  const url = URL.createObjectURL(blob);
+  try {
+    v.src = url;
+    v.play().catch(() => {});                       // iPhone won't load a video it isn't playing
+    await new Promise((res, rej) => {
+      v.onloadeddata = res; v.onerror = () => rej(v.error);
+      setTimeout(() => rej(new Error('timeout')), 25000);
+    });
+    v.pause();
+    if (v.duration > 1) {
+      v.currentTime = Math.min(0.5, v.duration / 4);
+      await new Promise(r => { v.onseeked = r; setTimeout(r, 3000); });
+    }
+    if (!v.videoWidth) return { none: true };
+    const sc = Math.min(1, 1280 / Math.max(v.videoWidth, v.videoHeight));
+    const w = Math.round(v.videoWidth * sc), h = Math.round(v.videoHeight * sc);
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').drawImage(v, 0, 0, w, h);
+    return { blob: await new Promise(r => c.toBlob(r, 'image/jpeg', 0.8)) };
+  } finally {
+    v.removeAttribute('src'); v.load(); URL.revokeObjectURL(url);
+  }
+}
 async function makeThumb(it) {
+  if (it.type === 'video') return videoPoster(it.blob);
   if (worker) {
     const res = await new Promise(r => { waiting.set(it.id, r); worker.postMessage({ id: it.id, blob: it.blob, max: THUMB_MAX }); });
     if (!res.error) return res;
@@ -450,7 +478,7 @@ async function makeThumb(it) {
   return thumbOnMainThread(it.blob);
 }
 const thumbFailed = new Set();
-const needsThumb = it => it && it.local && it.type === 'image' && it.blob && !it.thumb && !it.noThumb && !thumbFailed.has(it.id);
+const needsThumb = it => it && it.local && it.blob && !it.thumb && !it.noThumb && !thumbFailed.has(it.id);
 async function thumbOne(it) {
   try {
     const res = await makeThumb(it);
@@ -460,6 +488,8 @@ async function thumbOne(it) {
     it.thumb = URL.createObjectURL(res.blob);
     const c = cache.get(it.id), fg = c?.querySelector('.fg');
     if (fg && c !== card) { fg.src = it.thumb; fg.decode?.().catch(() => {}); }   // swap only if offscreen
+    const vv = c?.querySelector('video');
+    if (vv && !vv.poster) vv.poster = it.thumb;
   } catch { thumbFailed.add(it.id); }
 }
 let thumbBusy = false, thumbTimer;
@@ -468,7 +498,7 @@ async function thumbLoop() {
   if (thumbBusy) return;
   thumbBusy = true;
   try {
-    while (!down && !anim && !uploading) {
+    while (!down && !anim && !uploading && !(curVideo() && curVideo().readyState < 3 && !curVideo().error)) {
       // nearby photos first, then the next dozen, then everything else
       let it = neighbors().map(id => items.get(id)).find(needsThumb);
       if (!it) {
@@ -499,7 +529,7 @@ async function videoTrouble(id, c, v) {
         it.blob = rec.blob; it.src = URL.createObjectURL(rec.blob);
         v.src = it.src; v.load();
         if (c === card && !atHome) v.play().catch(() => {});
-        setTimeout(() => { if (v.readyState < 2) videoTrouble(id, c, v); }, 8000);
+        setTimeout(() => { if (v.readyState === 0 || v.error) videoTrouble(id, c, v); }, 20000);
         return;
       }
     } catch {}
@@ -519,6 +549,16 @@ async function videoTrouble(id, c, v) {
   c.querySelector('video')?.pause();
   c.innerHTML = `<div class="err">⚠️<br>Couldn’t play this video.<br>${why}<br><small>${(it.name || '').replace(/[<>&]/g, '')}${type}${mb}${code ? ' · error ' + code : ''}</small></div>`;
   if (c === card) updateUI();
+}
+
+// iPhone only buffers a video once it has played, so play the neighbors silently for a moment, then pause
+function warmVideo(c) {
+  const v = c.querySelector('video');
+  if (!v || c._warm || c === card || v.error) return;
+  c._warm = true;
+  v.muted = true;
+  v.addEventListener('playing', () => { if (c !== card) { v.pause(); try { v.currentTime = 0; } catch {} } }, { once: true });
+  v.play().catch(() => { c._warm = false; });
 }
 
 /* ---------- rendering ---------- */
@@ -550,13 +590,14 @@ function render() {
   layout(0);
   want.forEach(c => { if (!c.isConnected) stage.appendChild(c); });
   want.forEach(c => { if (c !== card) c.querySelector('video')?.pause(); });
+  if (!atHome) slots.forEach(({ el, pos }) => { if (Math.abs(pos) === 1) warmVideo(el); });
   const vid = card.querySelector('video');
   if (vid && !atHome) {
     vid.muted = muted;
     vid.play().catch(() => { if (vid.readyState >= 2) card._vset?.('paused'); });
     const c = card, id = curId;
     clearTimeout(videoWatch);
-    videoWatch = setTimeout(() => { if (c === card && (vid.readyState < 2 || vid.error)) videoTrouble(id, c, vid); }, 7000);
+    videoWatch = setTimeout(() => { if (c === card && (vid.readyState === 0 || vid.error)) videoTrouble(id, c, vid); }, 20000);
   }
   if (watchId !== curId) { stopWatch(); startWatch(); }
   updateUI(); saveCur(); prune(); thumbsSoon();
@@ -997,7 +1038,7 @@ $('#bkFile').addEventListener('change', async e => {
 });
 
 /* ---------- updates: the page checks GitHub for a newer version of itself ---------- */
-const APP_VERSION = '7';
+const APP_VERSION = '8';
 async function checkUpdate() {
   try {
     const res = await fetch(location.pathname + '?check=' + Date.now(), { cache: 'no-store' });
