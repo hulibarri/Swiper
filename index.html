@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0e0e10">
+<title>Shuffle</title>
+<style>
+:root{--bg:#0e0e10;--fg:#f4f4f5;--muted:#8a8a93;--accent:#ff4d6d}
+*{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden;overscroll-behavior:none;user-select:none;-webkit-user-select:none}
+header,footer{position:fixed;left:0;right:0;display:flex;align-items:center;gap:8px;padding:10px 14px;z-index:5}
+header{top:0;padding-top:calc(env(safe-area-inset-top) + 10px);background:linear-gradient(#000b,transparent);justify-content:space-between}
+footer{bottom:0;padding-bottom:calc(env(safe-area-inset-bottom) + 14px);background:linear-gradient(transparent,#000b);justify-content:space-between}
+h1{font-size:18px;font-weight:700;letter-spacing:.5px}
+.row{display:flex;gap:8px;align-items:center}
+.btn{background:#ffffff22;border:0;color:var(--fg);font:inherit;font-size:15px;min-width:40px;height:40px;padding:0 12px;border-radius:999px;cursor:pointer;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:inline-flex;align-items:center;justify-content:center}
+.btn.on{background:var(--accent)}
+.btn[hidden]{display:none}
+#fav{font-size:22px}
+#fav.on{background:transparent;color:var(--accent)}
+#counter{color:var(--muted);font-size:14px;font-variant-numeric:tabular-nums}
+#stage{position:fixed;inset:0;touch-action:none;overflow:hidden}
+.card{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;will-change:transform}
+.card img,.card video{max-width:100%;max-height:100%;object-fit:contain;pointer-events:none}
+#empty{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:30px;color:var(--muted);z-index:1}
+#empty[hidden]{display:none}
+#empty .big{font-size:54px}
+#toast{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#000c;padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;z-index:9;pointer-events:none}
+#toast.show{opacity:1}
+.burst{position:fixed;font-size:90px;color:var(--accent);pointer-events:none;z-index:8;transform:translate(-50%,-50%) scale(.3);opacity:0;animation:pop .7s ease-out forwards}
+@keyframes pop{30%{transform:translate(-50%,-50%) scale(1.15);opacity:1}100%{transform:translate(-50%,-70%) scale(1);opacity:0}}
+input[type=file]{display:none}
+</style>
+</head>
+<body>
+<div id="stage"></div>
+
+<div id="empty">
+  <div class="big">🖼️</div>
+  <div id="emptyText">Tap <b>+</b> to add photos &amp; videos</div>
+</div>
+
+<header>
+  <h1>Shuffle</h1>
+  <div class="row">
+    <button class="btn" id="favOnly" title="Show favorites only">★</button>
+    <button class="btn" id="shuffle" title="Reshuffle">🔀</button>
+    <label class="btn" for="file" title="Add photos/videos">＋</label>
+    <input type="file" id="file" accept="image/*,video/*" multiple>
+  </div>
+</header>
+
+<footer>
+  <div class="row">
+    <button class="btn" id="del" title="Delete">🗑</button>
+    <button class="btn" id="mute" title="Sound" hidden>🔇</button>
+  </div>
+  <span id="counter"></span>
+  <button class="btn" id="fav" title="Favorite">♡</button>
+</footer>
+
+<div id="toast"></div>
+
+<script>
+/* ---------- storage (IndexedDB for files, localStorage for favorites & position) ---------- */
+const dbp = new Promise((res, rej) => {
+  const r = indexedDB.open('shuffle-db', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('media', { keyPath: 'id' });
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+async function idb(mode, fn) {
+  const db = await dbp;
+  return new Promise((res, rej) => {
+    const t = db.transaction('media', mode);
+    const req = fn(t.objectStore('media'));
+    t.oncomplete = () => res(req && req.result);
+    t.onerror = () => rej(t.error);
+  });
+}
+const idbAll = () => idb('readonly', s => s.getAll());
+const idbPut = v => idb('readwrite', s => s.put(v));
+const idbDel = id => idb('readwrite', s => s.delete(id));
+navigator.storage?.persist?.();
+
+const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d } catch { return d } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)) } catch {} };
+
+/* ---------- state ---------- */
+const $ = s => document.querySelector(s);
+const stage = $('#stage');
+const items = new Map();           // id -> {id,type,src,local}
+let order = [];                    // shuffled ids
+let curId = null;
+let favOnly = false;
+let muted = true;
+let card = null;
+const favs = new Set(load('favs', []));
+
+const saveFavs = () => save('favs', [...favs]);
+const saveState = () => save('state', { order, curId, favOnly });
+const view = () => favOnly ? order.filter(id => favs.has(id)) : order;
+const current = () => items.get(curId);
+const typeOf = p => /\.(mp4|webm|mov|m4v|ogv)$/i.test(p) ? 'video' : 'image';
+
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function insertRandom(id) {
+  order.splice(Math.floor(Math.random() * (order.length + 1)), 0, id);
+}
+
+/* ---------- rendering ---------- */
+function makeCard(item) {
+  const c = document.createElement('div');
+  c.className = 'card';
+  let el;
+  if (item.type === 'video') {
+    el = document.createElement('video');
+    el.src = item.src;
+    el.loop = true; el.muted = muted; el.playsInline = true; el.autoplay = true;
+    el.setAttribute('playsinline', '');
+  } else {
+    el = document.createElement('img');
+    el.src = item.src; el.draggable = false; el.alt = '';
+  }
+  c.appendChild(el);
+  return c;
+}
+
+function show(dir = 0) {
+  const v = view();
+  if (!v.length) {
+    if (card) { card.remove(); card = null; }
+    updateUI(); saveState(); return;
+  }
+  if (!v.includes(curId)) curId = v[0];
+
+  const next = makeCard(current());
+  stage.appendChild(next);
+  if (card) {
+    const old = card;
+    old.querySelector('video')?.pause();
+    if (dir) {
+      next.style.transform = `translateX(${dir * 100}%)`;
+      next.getBoundingClientRect();
+      next.style.transition = old.style.transition = 'transform .28s ease';
+      next.style.transform = 'translateX(0)';
+      old.style.transform = `translateX(${-dir * 110}%)`;
+      setTimeout(() => { old.remove(); next.style.transition = ''; }, 300);
+    } else old.remove();
+  }
+  card = next;
+  updateUI(); saveState();
+}
+
+function go(dir) {
+  const v = view();
+  if (v.length < 2) { snapBack(); return; }
+  const i = v.indexOf(curId);
+  curId = v[(i + dir + v.length) % v.length];
+  show(dir);
+}
+
+function updateUI() {
+  const v = view(), it = current(), has = !!card;
+  $('#empty').hidden = has;
+  $('#emptyText').innerHTML = items.size
+    ? 'No favorites yet.<br>Double-tap something you love ♥'
+    : 'Tap <b>+</b> to add photos &amp; videos';
+  $('#counter').textContent = has ? `${v.indexOf(curId) + 1} / ${v.length}` : '';
+  const isFav = has && favs.has(curId);
+  $('#fav').textContent = isFav ? '♥' : '♡';
+  $('#fav').classList.toggle('on', isFav);
+  $('#fav').hidden = !has;
+  $('#del').hidden = !(has && it?.local);
+  $('#mute').hidden = !(has && it?.type === 'video');
+  $('#mute').textContent = muted ? '🔇' : '🔊';
+  $('#favOnly').classList.toggle('on', favOnly);
+}
+
+let toastT;
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 1200);
+}
+function burst(x, y) {
+  const b = document.createElement('div');
+  b.className = 'burst'; b.textContent = '♥';
+  b.style.left = x + 'px'; b.style.top = y + 'px';
+  document.body.appendChild(b);
+  setTimeout(() => b.remove(), 750);
+}
+
+/* ---------- favorites ---------- */
+function toggleFav(forceOn = false) {
+  if (!curId) return;
+  if (favs.has(curId) && !forceOn) favs.delete(curId); else favs.add(curId);
+  saveFavs();
+  if (favOnly && !favs.has(curId)) { const v = view(); curId = v[0] ?? null; show(); }
+  else updateUI();
+}
+
+/* ---------- swipe & tap ---------- */
+let sx = 0, sy = 0, dx = 0, down = false, t0 = 0, lastTap = 0, tapTimer;
+function snapBack() {
+  if (!card) return;
+  card.style.transition = 'transform .2s ease';
+  card.style.transform = '';
+}
+stage.addEventListener('pointerdown', e => {
+  if (!card) return;
+  down = true; sx = e.clientX; sy = e.clientY; dx = 0; t0 = Date.now();
+  card.style.transition = 'none';
+  stage.setPointerCapture(e.pointerId);
+});
+stage.addEventListener('pointermove', e => {
+  if (!down || !card) return;
+  dx = e.clientX - sx;
+  card.style.transform = `translateX(${dx}px) rotate(${dx / 40}deg)`;
+});
+stage.addEventListener('pointerup', e => {
+  if (!down) return;
+  down = false;
+  if (Math.abs(dx) > 70) go(dx < 0 ? 1 : -1);
+  else {
+    snapBack();
+    if (Math.abs(dx) < 8 && Math.abs(e.clientY - sy) < 8 && Date.now() - t0 < 300) tap(e);
+  }
+});
+stage.addEventListener('pointercancel', () => { down = false; snapBack(); });
+
+function tap(e) {
+  const now = Date.now();
+  if (now - lastTap < 300) {          // double tap = favorite
+    clearTimeout(tapTimer); lastTap = 0;
+    toggleFav(true); burst(e.clientX, e.clientY);
+  } else {                             // single tap = play/pause video
+    lastTap = now;
+    tapTimer = setTimeout(() => {
+      const v = card?.querySelector('video');
+      if (v) v.paused ? v.play() : v.pause();
+    }, 300);
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight') go(1);
+  else if (e.key === 'ArrowLeft') go(-1);
+  else if (e.key === 'f') toggleFav();
+});
+
+/* ---------- buttons ---------- */
+$('#fav').onclick = () => toggleFav();
+$('#favOnly').onclick = () => {
+  favOnly = !favOnly;
+  toast(favOnly ? 'Favorites only' : 'Showing everything');
+  show();
+};
+$('#shuffle').onclick = () => {
+  if (!order.length) return;
+  shuffle(order); curId = view()[0]; show(1); toast('Shuffled 🔀');
+};
+$('#mute').onclick = () => {
+  muted = !muted;
+  const v = card?.querySelector('video');
+  if (v) { v.muted = muted; v.play(); }
+  updateUI();
+};
+$('#del').onclick = async () => {
+  const it = current();
+  if (!it?.local || !confirm('Delete this from the gallery?')) return;
+  await idbDel(it.id);
+  URL.revokeObjectURL(it.src);
+  const v = view(), i = v.indexOf(it.id);
+  items.delete(it.id); favs.delete(it.id); saveFavs();
+  order = order.filter(id => id !== it.id);
+  const nv = view();
+  curId = nv.length ? nv[Math.min(i, nv.length - 1)] : null;
+  show(nv.length ? 1 : 0);
+  toast('Deleted');
+};
+
+$('#file').addEventListener('change', async e => {
+  const files = [...e.target.files]; e.target.value = '';
+  let first = null, n = 0;
+  for (const f of files) {
+    if (!/^(image|video)\//.test(f.type)) continue;
+    const id = 'local:' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const type = f.type.startsWith('video') ? 'video' : 'image';
+    try { await idbPut({ id, type, blob: f, name: f.name, added: Date.now() }); }
+    catch { toast('Storage full — couldn’t save everything'); break; }
+    items.set(id, { id, type, src: URL.createObjectURL(f), local: true });
+    insertRandom(id); first ??= id; n++;
+  }
+  if (!n) return;
+  if (!card || favOnly) { favOnly = false; curId = first; show(); }
+  else { updateUI(); saveState(); }
+  toast(`Added ${n} ✨`);
+});
+
+/* ---------- startup ---------- */
+(async function init() {
+  try {
+    for (const r of await idbAll())
+      items.set(r.id, { id: r.id, type: r.type, src: URL.createObjectURL(r.blob), local: true });
+  } catch {}
+
+  // Optional: files committed to the repo, listed in media.json, e.g. ["media/beach.jpg","media/clip.mp4"]
+  try {
+    const res = await fetch('media.json', { cache: 'no-store' });
+    if (res.ok) for (const p of await res.json()) {
+      const id = 'repo:' + p;
+      items.set(id, { id, type: typeOf(p), src: p, local: false });
+    }
+  } catch {}
+
+  const st = load('state', null);
+  if (st) {
+    order = (st.order || []).filter(id => items.has(id));
+    curId = st.curId; favOnly = !!st.favOnly;
+  }
+  const fresh = shuffle([...items.keys()].filter(id => !order.includes(id)));
+  if (!order.length) order = fresh; else fresh.forEach(insertRandom);
+  for (const id of [...favs]) if (!items.has(id)) favs.delete(id);
+  saveFavs();
+  show();
+})();
+</script>
+</body>
+</html>
