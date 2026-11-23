@@ -25,7 +25,7 @@ h1{font-size:18px;font-weight:700;letter-spacing:.5px}
 #stage{position:fixed;inset:0;touch-action:none;overflow:hidden;background:var(--bg)}
 .card{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--bg);will-change:transform}
 .card .fg,.card video{position:relative;max-width:100%;max-height:100%;object-fit:contain;pointer-events:none}
-.card .bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(28px) brightness(.45);transform:scale(1.2);pointer-events:none}
+.card .bg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 
 /* video timeline */
 #scrub{position:fixed;left:0;right:0;bottom:calc(env(safe-area-inset-bottom) + 64px);display:flex;gap:10px;align-items:center;padding:0 16px;z-index:6;font-size:13px;color:#e4e4e7;font-variant-numeric:tabular-nums;touch-action:none}
@@ -42,6 +42,18 @@ h1{font-size:18px;font-weight:700;letter-spacing:.5px}
 #empty{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:30px;color:var(--muted);z-index:1}
 #empty[hidden]{display:none}
 #empty .big{font-size:54px}
+.card .err{color:var(--muted);text-align:center;padding:30px;font-size:15px;line-height:1.6}
+#undo{position:fixed;left:50%;top:calc(env(safe-area-inset-top) + 66px);transform:translateX(-50%);background:#000d;border-radius:999px;padding:6px 6px 6px 16px;display:flex;gap:12px;align-items:center;z-index:9;font-size:14px;white-space:nowrap}
+#undo[hidden]{display:none}
+#undo .btn{background:var(--accent);height:32px}
+#prog{position:fixed;inset:0;background:#000b;display:flex;align-items:center;justify-content:center;z-index:20;touch-action:none}
+#prog[hidden]{display:none}
+#prog .box{background:#1c1c21;border-radius:18px;padding:24px 22px;width:min(330px,88vw);text-align:center}
+#progTitle{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+#progText{color:#d4d4d8;font-size:14px;margin-top:6px;font-variant-numeric:tabular-nums}
+#prog .bar{height:10px;background:#ffffff22;border-radius:5px;overflow:hidden;margin:16px 0 12px}
+#progBar{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+#prog .sub{color:#fbbf24;font-size:13px;font-weight:600}
 #toast{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#000c;padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;z-index:9;pointer-events:none}
 #toast.show{opacity:1}
 .burst{position:fixed;font-size:90px;color:var(--accent);pointer-events:none;z-index:8;transform:translate(-50%,-50%) scale(.3);opacity:0;animation:pop .7s ease-out forwards}
@@ -82,27 +94,41 @@ input[type=file]{display:none}
   <button class="btn" id="fav" title="Favorite">♡</button>
 </footer>
 
+<div id="prog" hidden>
+  <div class="box">
+    <div id="progTitle"></div>
+    <div id="progText"></div>
+    <div class="bar"><i id="progBar"></i></div>
+    <div class="sub">⚠️ Keep this page open until it’s done</div>
+  </div>
+</div>
+<div id="undo" hidden><span>Deleted</span><button class="btn" id="undoBtn">Undo</button></div>
 <div id="toast"></div>
 
 <script>
 /* ---------- storage (IndexedDB for files, localStorage for favorites & position) ---------- */
-const dbp = new Promise((res, rej) => {
-  const r = indexedDB.open('shuffle-db', 1);
+const timeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+const dbp = timeout(new Promise((res, rej) => {
+  let r;
+  try { r = indexedDB.open('shuffle-db', 1); } catch (e) { return rej(e); }
   r.onupgradeneeded = () => r.result.createObjectStore('media', { keyPath: 'id' });
   r.onsuccess = () => res(r.result);
   r.onerror = () => rej(r.error);
-});
+}), 5000);
+dbp.catch(() => {});
 async function idb(mode, fn) {
   const db = await dbp;
-  return new Promise((res, rej) => {
+  return timeout(new Promise((res, rej) => {
     const t = db.transaction('media', mode);
     const req = fn(t.objectStore('media'));
     t.oncomplete = () => res(req && req.result);
     t.onerror = () => rej(t.error);
-  });
+    t.onabort = () => rej(t.error);
+  }), 15000);
 }
 const idbAll = () => idb('readonly', s => s.getAll());
 const idbPut = v => idb('readwrite', s => s.put(v));
+const idbPutMany = list => idb('readwrite', s => { list.forEach(v => s.put(v)); });
 const idbDel = id => idb('readwrite', s => s.delete(id));
 navigator.storage?.persist?.();
 
@@ -119,9 +145,13 @@ let curId = null;
 let favOnly = false;
 let muted = true;
 let card = null;
+let shownId = null;                // what's actually on screen right now
 let showSeq = 0;
+let notice = '';
 const favs = new Set(load('favs', []));
 
+const fpMap = load('fps', {});     // id -> fingerprint, used to spot duplicates
+const saveFps = () => save('fps', fpMap);
 const saveFavs = () => save('favs', [...favs]);
 const saveState = () => save('state', { order, curId, favOnly });
 const view = () => favOnly ? order.filter(id => favs.has(id)) : order;
@@ -141,31 +171,40 @@ function insertRandom(id) {
   order.splice(Math.floor(Math.random() * (order.length + 1)), 0, id);
 }
 
-/* ---------- cards: built ahead of time so swipes are instant ---------- */
+/* ---------- cards: current + neighbors live side by side, ready to slide in ---------- */
 function getCard(id) {
   let c = cache.get(id);
   if (c) return c;
   const item = items.get(id);
   c = document.createElement('div');
   c.className = 'card';
+  const fail = () => {
+    c.innerHTML = '<div class="err">⚠️<br>Couldn’t load this one.<br>Swipe on, or tap 🗑 to remove it.</div>';
+  };
   if (item.type === 'video') {
     const v = document.createElement('video');
-    v.src = item.src;
     v.loop = true; v.muted = muted; v.playsInline = true; v.preload = 'auto';
     v.setAttribute('playsinline', '');
+    v.addEventListener('error', fail, { once: true });
+    v.src = item.src;
     c.appendChild(v);
-    c._ready = new Promise(r => {
-      if (v.readyState >= 2) return r();
-      v.addEventListener('loadeddata', r, { once: true });
-      v.addEventListener('error', r, { once: true });
-    });
   } else {
-    const bg = document.createElement('img');
-    bg.className = 'bg'; bg.src = item.src; bg.alt = ''; bg.draggable = false;
+    // tiny 24px copy stretched behind the photo = soft blurred background, almost free to draw
+    const bg = document.createElement('canvas');
+    bg.className = 'bg'; bg.width = bg.height = 24;
     const fg = document.createElement('img');
-    fg.className = 'fg'; fg.src = item.src; fg.alt = ''; fg.draggable = false;
+    fg.className = 'fg'; fg.alt = ''; fg.draggable = false; fg.decoding = 'async';
+    fg.addEventListener('load', () => {
+      try {
+        const x = bg.getContext('2d');
+        x.drawImage(fg, 0, 0, 24, 24);
+        x.fillStyle = 'rgba(0,0,0,.5)'; x.fillRect(0, 0, 24, 24);
+      } catch {}
+    }, { once: true });
+    fg.addEventListener('error', fail, { once: true });
+    fg.src = item.src;
     c.append(bg, fg);
-    c._ready = Promise.all([fg.decode(), bg.decode()]).catch(() => {});
+    fg.decode?.().catch(() => {});
   }
   cache.set(id, c);
   return c;
@@ -174,8 +213,10 @@ function neighbors() {
   const v = view(), n = v.length, i = v.indexOf(curId);
   if (!n || i < 0) return [];
   const ids = [v[i], v[(i + 1) % n], v[(i - 1 + n) % n]];
-  const two = v[(i + 2) % n];
-  if (items.get(two)?.type === 'image') ids.push(two);   // images are cheap, look 2 ahead
+  for (const k of [2, -2]) {                       // images are cheap: get 2 ahead/behind ready too
+    const id = v[(i + k + n * 2) % n];
+    if (items.get(id)?.type === 'image') ids.push(id);
+  }
   return [...new Set(ids)];
 }
 function preload() { neighbors().forEach(getCard); }
@@ -190,61 +231,64 @@ function prune() {
 }
 
 /* ---------- rendering ---------- */
-async function show(dir = 0) {
+let prevEl = null, nextEl = null, anim = null;
+const W = () => stage.clientWidth || innerWidth;
+function place(el, pos, dx, animate) {
+  if (!el) return;
+  el.style.transition = animate ? 'transform .2s cubic-bezier(.25,.8,.25,1)' : 'none';
+  el.style.transform = `translate3d(${pos * W() + dx}px,0,0)`;
+}
+function layout(dx = 0, animate = false) {
+  place(card, 0, dx, animate);
+  if (prevEl && prevEl === nextEl) place(nextEl, dx > 0 ? -1 : 1, dx, animate);   // only 2 items
+  else { place(prevEl, -1, dx, animate); place(nextEl, 1, dx, animate); }
+}
+function render() {
   const v = view();
   if (!v.length) {
-    [...stage.children].forEach(c => c.remove());
-    card = null; updateUI(); saveState(); return;
+    [...stage.children].forEach(c => { c.querySelector('video')?.pause(); c.remove(); });
+    card = prevEl = nextEl = null;
+    updateUI(); saveState(); return;
   }
   if (!v.includes(curId)) curId = v[0];
-
-  const seq = ++showSeq;
-  const next = getCard(curId);
-  card = next;
-  updateUI(); saveState(); preload();
-
-  await wait(next._ready, 500);           // don't slide in until it's actually drawn
-  if (seq !== showSeq) return;            // user already swiped again
-
-  const olds = [...stage.children].filter(c => c !== next);
-  const animate = dir && olds.length;
-  next.style.transition = 'none';
-  next.style.transform = animate ? `translateX(${dir * 100}%)` : '';
-  if (!next.isConnected) stage.appendChild(next);
-  next.getBoundingClientRect();
-  if (animate) {
-    next.style.transition = 'transform .25s ease';
-    next.style.transform = 'translateX(0)';
-    olds.forEach(o => {
-      o.style.transition = 'transform .25s ease';
-      o.style.transform = `translateX(${-dir * 110}%)`;
-    });
-  }
-  olds.forEach(o => o.querySelector('video')?.pause());
-  const vid = next.querySelector('video');
+  const n = v.length, i = v.indexOf(curId);
+  card = getCard(curId);
+  prevEl = n > 1 ? getCard(v[(i - 1 + n) % n]) : null;
+  nextEl = n > 1 ? getCard(v[(i + 1) % n]) : null;
+  const want = new Set([card, prevEl, nextEl].filter(Boolean));
+  [...stage.children].forEach(c => { if (!want.has(c)) { c.querySelector('video')?.pause(); c.remove(); } });
+  want.forEach(c => { if (!c.isConnected) stage.appendChild(c); });
+  layout(0);
+  want.forEach(c => { if (c !== card) c.querySelector('video')?.pause(); });
+  const vid = card.querySelector('video');
   if (vid) { vid.muted = muted; vid.play().catch(() => {}); }
-
-  setTimeout(() => {
-    olds.forEach(o => { if (o !== card) { o.remove(); o.style.transform = ''; o.style.transition = ''; } });
-    if (next === card) next.style.transition = '';
-    prune();
-  }, animate ? 270 : 0);
+  updateUI(); saveState(); preload(); prune();
 }
-
-function go(dir) {
+function finishAnim() {
+  if (!anim) return false;
+  clearTimeout(anim.timer);
+  curId = anim.toId; anim = null;
+  render();
+  return true;
+}
+function show() { if (!finishAnim()) render(); }
+function go(dir) {                 // +1 = next, -1 = previous
+  finishAnim();
   const v = view();
-  if (v.length < 2) { snapBack(); return; }
+  if (v.length < 2) { layout(0, true); return; }
   const i = v.indexOf(curId);
-  curId = v[(i + dir + v.length) % v.length];
-  show(dir);
+  const toId = v[(i + dir + v.length) % v.length];
+  card?.querySelector('video')?.pause();
+  layout(-dir * W(), true);
+  anim = { toId, timer: setTimeout(finishAnim, 200) };
 }
 
 function updateUI() {
   const v = view(), it = current(), has = !!card;
   $('#empty').hidden = has;
-  $('#emptyText').innerHTML = items.size
+  $('#emptyText').innerHTML = notice || (items.size
     ? 'No favorites yet.<br>Double-tap something you love ♥'
-    : 'Tap <b>+</b> to add photos &amp; videos';
+    : 'Tap <b>+</b> to add photos &amp; videos');
   $('#counter').textContent = has ? `${v.indexOf(curId) + 1} / ${v.length}` : '';
   const isFav = has && favs.has(curId);
   $('#fav').textContent = isFav ? '♥' : '♡';
@@ -260,9 +304,9 @@ function updateUI() {
 }
 
 let toastT;
-function toast(msg) {
+function toast(msg, ms = 1200) {
   const t = $('#toast'); t.textContent = msg; t.classList.add('show');
-  clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 1200);
+  clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), ms);
 }
 function burst(x, y) {
   const b = document.createElement('div');
@@ -330,33 +374,33 @@ function toggleFav(forceOn = false) {
 }
 
 /* ---------- swipe & tap ---------- */
-let sx = 0, sy = 0, dx = 0, down = false, t0 = 0, lastTap = 0, tapTimer;
-function snapBack() {
-  if (!card) return;
-  card.style.transition = 'transform .2s ease';
-  card.style.transform = '';
-}
+let sx = 0, sy = 0, dx = 0, down = false, t0 = 0, px = 0, pt = 0, vel = 0, lastTap = 0, tapTimer;
 stage.addEventListener('pointerdown', e => {
   if (!card) return;
-  down = true; sx = e.clientX; sy = e.clientY; dx = 0; t0 = Date.now();
-  card.style.transition = 'none';
+  finishAnim();
+  down = true; sx = px = e.clientX; sy = e.clientY; dx = 0; vel = 0; t0 = pt = performance.now();
   stage.setPointerCapture(e.pointerId);
 });
 stage.addEventListener('pointermove', e => {
-  if (!down || !card) return;
+  if (!down) return;
+  const now = performance.now();
+  if (now > pt) vel = 0.6 * vel + 0.4 * ((e.clientX - px) / (now - pt));
+  px = e.clientX; pt = now;
   dx = e.clientX - sx;
-  card.style.transform = `translateX(${dx}px) rotate(${dx / 40}deg)`;
+  layout(view().length < 2 ? dx * 0.3 : dx);
 });
 stage.addEventListener('pointerup', e => {
   if (!down) return;
   down = false;
-  if (Math.abs(dx) > 70) go(dx < 0 ? 1 : -1);
+  const flick = Math.abs(vel) > 0.35 && Math.abs(dx) > 15;     // quick flick counts too
+  if (Math.abs(dx) > W() * 0.2 || flick) go((flick ? -vel : -dx) > 0 ? 1 : -1);
   else {
-    snapBack();
-    if (Math.abs(dx) < 8 && Math.abs(e.clientY - sy) < 8 && Date.now() - t0 < 300) tap(e);
+    layout(0, true);
+    if (Math.abs(dx) < 8 && Math.abs(e.clientY - sy) < 8 && performance.now() - t0 < 300) tap(e);
   }
 });
-stage.addEventListener('pointercancel', () => { down = false; snapBack(); });
+stage.addEventListener('pointercancel', () => { down = false; layout(0, true); });
+addEventListener('resize', () => layout(0));
 
 function tap(e) {
   const now = Date.now();
@@ -396,47 +440,180 @@ $('#mute').onclick = () => {
   curVideo()?.play().catch(() => {});
   updateUI();
 };
-$('#del').onclick = async () => {
+/* Delete is instant (no popup) with an Undo. The file is really erased from storage
+   when the Undo goes away, when you delete the next one, or when you leave the page. */
+let pending = null, undoTimer;
+function finalizeDelete() {
+  if (!pending) return;
+  const { it } = pending;
+  pending = null;
+  clearTimeout(undoTimer);
+  $('#undo').hidden = true;
+  idbDel(it.id).catch(() => {});
+  URL.revokeObjectURL(it.src);
+  delete fpMap[it.id]; saveFps();
+}
+$('#del').onclick = () => {
   const it = current();
-  if (!it?.local || !confirm('Delete this from the gallery?')) return;
-  await idbDel(it.id);
+  if (!it?.local) return;
+  finalizeDelete();                                   // erase the previous one for real
   const v = view(), i = v.indexOf(it.id);
+  const oi = order.indexOf(it.id);
   const c = cache.get(it.id);
   if (c) { c.querySelector('video')?.pause(); c.remove(); cache.delete(it.id); }
-  URL.revokeObjectURL(it.src);
-  items.delete(it.id); favs.delete(it.id); saveFavs();
+  const wasFav = favs.delete(it.id); saveFavs();
+  items.delete(it.id);
   order = order.filter(id => id !== it.id);
+  pending = { it, oi, wasFav };
   const nv = view();
   curId = nv.length ? nv[Math.min(i, nv.length - 1)] : null;
   card = null;
   show();
-  toast('Deleted');
+  $('#undo').hidden = false;
+  clearTimeout(undoTimer);
+  undoTimer = setTimeout(finalizeDelete, 5000);
 };
+$('#undoBtn').onclick = () => {
+  if (!pending) return;
+  const { it, oi, wasFav } = pending;
+  pending = null;
+  clearTimeout(undoTimer);
+  $('#undo').hidden = true;
+  items.set(it.id, it);
+  order.splice(Math.min(oi, order.length), 0, it.id);
+  if (wasFav) { favs.add(it.id); saveFavs(); }
+  if (favOnly && !wasFav) favOnly = false;
+  curId = it.id;
+  show(-1);
+};
+document.addEventListener('visibilitychange', () => { if (document.hidden) finalizeDelete(); });
+window.addEventListener('pagehide', finalizeDelete);
+
+/* if anything goes wrong, say so instead of silently freezing */
+window.addEventListener('error', e => toast('Error: ' + e.message, 4000));
+window.addEventListener('unhandledrejection', e => toast('Error: ' + (e.reason?.message || e.reason), 4000));
+
+/* ---------- uploading: progress + duplicate check ---------- */
+// Fingerprint = size + SHA-256 of the first and last 256 KB. Fast even for big videos.
+const CHUNK = 256 * 1024;
+async function fingerprint(blob) {
+  const head = new Uint8Array(await blob.slice(0, CHUNK).arrayBuffer());
+  const tail = blob.size > CHUNK ? new Uint8Array(await blob.slice(-CHUNK).arrayBuffer()) : new Uint8Array(0);
+  const buf = new Uint8Array(head.length + tail.length + 8);
+  buf.set(head, 0); buf.set(tail, head.length);
+  new DataView(buf.buffer).setFloat64(head.length + tail.length, blob.size);
+  const h = new Uint8Array(await crypto.subtle.digest('SHA-256', buf));
+  return Array.from(h, b => b.toString(16).padStart(2, '0')).join('');
+}
+function progress(title, text, frac) {
+  $('#prog').hidden = false;
+  $('#progTitle').textContent = title;
+  $('#progText').textContent = text;
+  $('#progBar').style.width = Math.round(frac * 100) + '%';
+  document.title = `${Math.round(frac * 100)}% · Shuffle`;
+}
+function progressDone() {
+  $('#prog').hidden = true;
+  document.title = 'Shuffle';
+}
+let uploading = false, wakeLock = null;
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => { if (uploading && !document.hidden) keepAwake(); });
+window.addEventListener('beforeunload', e => { if (uploading) { e.preventDefault(); e.returnValue = ''; } });
+
+// Older uploads (from before duplicate checking) get fingerprinted once.
+async function ensureFingerprints() {
+  const todo = [...items.values()].filter(it => it.local && it.blob && !fpMap[it.id]);
+  for (let i = 0; i < todo.length; i++) {
+    try { fpMap[todo[i].id] = await fingerprint(todo[i].blob); } catch {}
+    if (i % 10 === 0) progress('Checking your library…', `${i} of ${todo.length}`, i / todo.length);
+  }
+  if (todo.length) saveFps();
+}
 
 $('#file').addEventListener('change', async e => {
-  const files = [...e.target.files]; e.target.value = '';
-  let first = null, n = 0;
-  for (const f of files) {
-    if (!/^(image|video)\//.test(f.type)) continue;
-    const id = 'local:' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    const type = f.type.startsWith('video') ? 'video' : 'image';
-    try { await idbPut({ id, type, blob: f, name: f.name, added: Date.now() }); }
-    catch { toast('Storage full — couldn’t save everything'); break; }
-    items.set(id, { id, type, src: URL.createObjectURL(f), local: true });
-    insertRandom(id); first ??= id; n++;
+  const files = [...e.target.files].filter(f => /^(image|video)\//.test(f.type));
+  e.target.value = '';
+  if (!files.length || uploading) return;
+  uploading = true;
+  keepAwake();
+  finalizeDelete();
+  progress('Getting ready…', '', 0);
+
+  await ensureFingerprints();
+  const seen = new Set(Object.values(fpMap));
+  const total = files.length;
+  let done = 0, added = 0, dupes = 0, first = null, full = false;
+  const BATCH = 20;
+
+  for (let s = 0; s < total && !full; s += BATCH) {
+    const recs = [], fps = {};
+    for (const f of files.slice(s, s + BATCH)) {
+      let fp = null;
+      try { fp = await fingerprint(f); } catch {}
+      if (fp && seen.has(fp)) { dupes++; continue; }
+      if (fp) seen.add(fp);
+      const id = 'local:' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      recs.push({ id, type: f.type.startsWith('video') ? 'video' : 'image', blob: f, name: f.name, added: Date.now() });
+      if (fp) fps[id] = fp;
+    }
+    try {
+      if (recs.length) await idbPutMany(recs);
+      for (const r of recs) {
+        items.set(r.id, { id: r.id, type: r.type, src: URL.createObjectURL(r.blob), blob: r.blob, local: true });
+        if (fps[r.id]) fpMap[r.id] = fps[r.id];
+        insertRandom(r.id); first ??= r.id; added++;
+      }
+      saveFps();
+    } catch { full = true; break; }
+
+    done = Math.min(s + BATCH, total);
+    progress(`${done} of ${total}`,
+      `${total - done} to go · ${added} added` + (dupes ? ` · ${dupes} duplicate${dupes > 1 ? 's' : ''} skipped` : ''),
+      done / total);
+    if (!card && first) { favOnly = false; curId = first; show(); } else updateUI();
+    saveState();
   }
-  if (!n) return;
-  if (!card || favOnly) { favOnly = false; curId = first; show(); }
-  else { updateUI(); saveState(); preload(); }
-  toast(`Added ${n} ✨`);
+
+  progressDone();
+  uploading = false;
+  try { await wakeLock?.release(); } catch {}
+  wakeLock = null;
+  if (first && favOnly) { favOnly = false; curId = first; show(); }
+  else { updateUI(); preload(); }
+
+  const dupeTxt = dupes ? `, skipped ${dupes} duplicate${dupes > 1 ? 's' : ''}` : '';
+  if (full) toast(`Phone storage full — added ${added} of ${total}${dupeTxt}`, 5000);
+  else toast(added ? `Added ${added} ✨${dupeTxt}` : `All ${dupes} were already in your gallery`, 3500);
 });
 
 /* ---------- startup ---------- */
 (async function init() {
-  try {
-    for (const r of await idbAll())
-      items.set(r.id, { id: r.id, type: r.type, src: URL.createObjectURL(r.blob), local: true });
-  } catch {}
+  // Visit the site with ?reset on the end to clear the saved position (keeps photos & favorites)
+  if (/[?&]reset\b/.test(location.search)) {
+    localStorage.removeItem('state');
+    history.replaceState(null, '', location.pathname);
+    toast('Reset ✓', 1500);
+  }
+
+  let rows;
+  try { rows = await wait(idbAll(), 6000); } catch {}
+  if (!Array.isArray(rows)) {
+    notice = 'Your saved photos didn’t load.<br>Fully close this browser tab and open the site again.';
+    rows = [];
+  }
+  for (const r of rows) {
+    try {
+      if (!r || !r.blob) continue;
+      items.set(r.id, { id: r.id, type: r.type, src: URL.createObjectURL(r.blob), blob: r.blob, local: true });
+    } catch {}
+  }
+  if (!notice) {   // forget fingerprints of things that no longer exist
+    for (const id of Object.keys(fpMap)) if (!items.has(id)) delete fpMap[id];
+    saveFps();
+  }
 
   // Optional: files committed to the repo, listed in media.json, e.g. ["media/beach.jpg","media/clip.mp4"]
   try {
