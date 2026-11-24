@@ -134,6 +134,7 @@ input[type=file]{display:none}
     <label class="btn wide" for="bkFile">⬆️ Restore backup</label>
     <input type="file" id="bkFile" accept=".json,application/json">
     <p class="small" id="bkLast"></p>
+    <p class="small" id="verText"></p>
     <button class="btn wide" id="reloadBtn">🔄 Reload app</button>
     <button class="btn wide" id="menuClose">Close</button>
   </div>
@@ -196,7 +197,7 @@ const cache = new Map();           // id -> prebuilt card element (current + nei
 let order = [];
 let curId = null;
 let favOnly = false;
-let muted = true;
+let muted = load('muted', true);    // your sound choice is remembered
 let card = null;
 let shownId = null;                // what's actually on screen right now
 let showSeq = 0;
@@ -209,6 +210,7 @@ const saveFavs = () => save('favs', [...favs]);
 const saveState = () => { save('state', { order, curId, favOnly, fy }); save('cur', curId); };
 const saveCur = () => save('cur', curId);
 let atHome = true;                 // privacy menu shows first
+let soundBlocked = false;           // iPhone refused to play with sound
 let fy = false, feed = [];          // For You mode + its running feed
 const view = () => fy ? feed : favOnly ? order.filter(id => favs.has(id)) : order;
 const current = () => items.get(curId);
@@ -594,7 +596,12 @@ function render() {
   const vid = card.querySelector('video');
   if (vid && !atHome) {
     vid.muted = muted;
-    vid.play().catch(() => { if (vid.readyState >= 2) card._vset?.('paused'); });
+    vid.play().catch(() => {
+      if (!vid.muted) {                       // iPhone refused sound without a tap: play silently instead
+        vid.muted = true; soundBlocked = true; updateUI();
+        vid.play().catch(() => { if (vid.readyState >= 2) card._vset?.('paused'); });
+      } else if (vid.readyState >= 2) card._vset?.('paused');
+    });
     const c = card, id = curId;
     clearTimeout(videoWatch);
     videoWatch = setTimeout(() => { if (c === card && (vid.readyState === 0 || vid.error)) videoTrouble(id, c, vid); }, 20000);
@@ -636,7 +643,7 @@ function updateUI() {
   $('#del').hidden = !(has && it?.local);
   const isVid = has && it?.type === 'video';
   $('#mute').hidden = !isVid;
-  $('#mute').textContent = muted ? '🔇' : '🔊';
+  $('#mute').textContent = muted || soundBlocked ? '🔇' : '🔊';
   $('#scrub').hidden = !isVid;
   if (isVid) { seek.value = 0; seek.style.setProperty('--p', '0%'); $('#tcur').textContent = '0:00'; $('#tdur').textContent = ''; }
   $('#favOnly').classList.toggle('on', favOnly);
@@ -796,7 +803,9 @@ $('#shuffle').onclick = () => {
   shuffle(order); curId = view()[0]; saveState(); show(1); toast('Shuffled 🔀');
 };
 $('#mute').onclick = () => {
-  muted = !muted;
+  muted = soundBlocked ? false : !muted;     // if sound was blocked, a tap turns it on
+  soundBlocked = false;
+  save('muted', muted);
   for (const c of cache.values()) { const v = c.querySelector('video'); if (v) v.muted = muted; }
   curVideo()?.play().catch(() => {});
   updateUI();
@@ -1038,7 +1047,7 @@ $('#bkFile').addEventListener('change', async e => {
 });
 
 /* ---------- updates: the page checks GitHub for a newer version of itself ---------- */
-const APP_VERSION = '8';
+const APP_VERSION = '9';
 async function checkUpdate() {
   try {
     const res = await fetch(location.pathname + '?check=' + Date.now(), { cache: 'no-store' });
@@ -1051,6 +1060,7 @@ function reloadFresh() {
   location.replace(location.pathname + '?v=' + Date.now());
 }
 $('#update').onclick = reloadFresh;
+$('#verText').textContent = 'Version ' + APP_VERSION;
 $('#reloadBtn').onclick = reloadFresh;
 document.addEventListener('visibilitychange', () => { if (!document.hidden) checkUpdate(); });
 setTimeout(checkUpdate, 3000);
