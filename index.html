@@ -915,9 +915,15 @@ async function ensureFingerprints() {
 }
 
 $('#file').addEventListener('change', async e => {
-  const files = [...e.target.files].filter(f => /^(image|video)\//.test(f.type));
+  const picked = [...e.target.files];
   e.target.value = '';
-  if (!files.length || uploading) return;
+  // some iPhone photos arrive with no type, so fall back to the file extension
+  const isVid = f => /^video\//.test(f.type) || (!f.type && /\.(mov|mp4|m4v|webm|3gp)$/i.test(f.name));
+  const isImg = f => /^image\//.test(f.type) || (!f.type && /\.(jpe?g|png|heic|heif|gif|webp|avif|dng)$/i.test(f.name));
+  const files = picked.filter(f => isImg(f) || isVid(f));
+  if (uploading) { toast('Still adding the last batch — try again when it’s done', 3000); return; }
+  if (!picked.length) { toast('Your phone didn’t send any files. Try picking fewer at once.', 4500); return; }
+  if (!files.length) { toast(`None of the ${picked.length} files were photos or videos`, 3500); return; }
   uploading = true;
   keepAwake();
   finalizeDelete();
@@ -937,7 +943,7 @@ $('#file').addEventListener('change', async e => {
       if (fp && seen.has(fp)) { dupes++; continue; }
       if (fp) seen.add(fp);
       const id = 'local:' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      recs.push({ id, type: f.type.startsWith('video') ? 'video' : 'image', blob: f, name: f.name, added: Date.now() });
+      recs.push({ id, type: isVid(f) ? 'video' : 'image', blob: f, name: f.name, added: Date.now() });
       if (fp) fps[id] = fp;
     }
     try {
@@ -1052,7 +1058,7 @@ $('#bkFile').addEventListener('change', async e => {
 });
 
 /* ---------- updates: the page checks GitHub for a newer version of itself ---------- */
-const APP_VERSION = '11';
+const APP_VERSION = '12';
 async function checkUpdate() {
   try {
     const res = await fetch(location.pathname + '?check=' + Date.now(), { cache: 'no-store' });
