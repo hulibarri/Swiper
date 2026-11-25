@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0e0e10">
+<meta name="apple-mobile-web-app-title" content="Shuffle">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="manifest" href="manifest.json">
 <title>Shuffle</title>
 <style>
 :root{--bg:#0e0e10;--fg:#f4f4f5;--muted:#8a8a93;--accent:#ff4d6d}
@@ -1047,7 +1052,7 @@ $('#bkFile').addEventListener('change', async e => {
 });
 
 /* ---------- updates: the page checks GitHub for a newer version of itself ---------- */
-const APP_VERSION = '10';
+const APP_VERSION = '11';
 async function checkUpdate() {
   try {
     const res = await fetch(location.pathname + '?check=' + Date.now(), { cache: 'no-store' });
